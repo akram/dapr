@@ -17,6 +17,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -29,10 +30,13 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 
+	"github.com/dapr/dapr/pkg/api/grpc/metadata"
 	channelt "github.com/dapr/dapr/pkg/channel/testing"
+	"github.com/dapr/dapr/pkg/config"
 	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
 	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
-	authConsts "github.com/dapr/dapr/pkg/runtime/security/consts"
+	securityConsts "github.com/dapr/dapr/pkg/security/consts"
+	daprt "github.com/dapr/dapr/pkg/testing"
 )
 
 // TODO: Add APIVersion testing
@@ -46,7 +50,10 @@ func TestMain(m *testing.M) {
 		log.Fatalf("failed to create listener: %v", err)
 	}
 
-	grpcServer := grpc.NewServer()
+	grpcServer := grpc.NewServer(
+		grpc.UnaryInterceptor(metadata.SetMetadataInContextUnary),
+		grpc.InTapHandle(metadata.SetMetadataInTapHandle),
+	)
 	mockServer = &channelt.MockServer{}
 	go func() {
 		runtimev1pb.RegisterAppCallbackServer(grpcServer, mockServer)
@@ -68,9 +75,9 @@ func TestMain(m *testing.M) {
 
 func createConnection(t *testing.T) *grpc.ClientConn {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-	conn, err := grpc.DialContext(ctx, "localhost:9998",
+	conn, err := grpc.DialContext(ctx, "localhost:9998", //nolint:staticcheck
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithBlock(),
+		grpc.WithBlock(), //nolint:staticcheck
 	)
 	cancel()
 	require.NoError(t, err, "failed to connect to gRPC server")
@@ -85,29 +92,59 @@ func closeConnection(t *testing.T, conn *grpc.ClientConn) {
 func TestInvokeMethod(t *testing.T) {
 	conn := createConnection(t)
 	defer closeConnection(t, conn)
-	c := Channel{baseAddress: "localhost:9998", client: conn, appMetadataToken: "token1", maxRequestBodySize: 4, readBufferSize: 4}
+	c := Channel{
+		baseAddress:        "localhost:9998",
+		appCallbackClient:  runtimev1pb.NewAppCallbackClient(conn),
+		conn:               conn,
+		appMetadataToken:   "token1",
+		maxRequestBodySize: 4 << 20,
+	}
 	ctx := context.Background()
 
-	req := invokev1.NewInvokeMethodRequest("method")
-	req.WithHTTPExtension(http.MethodPost, "param1=val1&param2=val2")
-	response, err := c.InvokeMethod(ctx, req)
-	assert.NoError(t, err)
-	contentType, body := response.RawData()
+	t.Run("successful request", func(t *testing.T) {
+		req := invokev1.NewInvokeMethodRequest("method").
+			WithHTTPExtension(http.MethodPost, "param1=val1&param2=val2")
+		defer req.Close()
+		response, err := c.InvokeMethod(ctx, req, "")
+		require.NoError(t, err)
+		defer response.Close()
 
-	assert.Equal(t, "application/json", contentType)
+		assert.Equal(t, "application/json", response.ContentType())
 
-	actual := map[string]string{}
-	json.Unmarshal(body, &actual)
+		actual := map[string]string{}
+		err = json.NewDecoder(response.RawData()).Decode(&actual)
 
-	assert.Equal(t, "POST", actual["httpverb"])
-	assert.Equal(t, "method", actual["method"])
-	assert.Equal(t, "token1", actual[authConsts.APITokenHeader])
-	assert.Equal(t, "param1=val1&param2=val2", actual["querystring"])
+		require.NoError(t, err)
+		assert.Equal(t, "POST", actual["httpverb"])
+		assert.Equal(t, "method", actual["method"])
+		assert.Equal(t, "token1", actual[securityConsts.APITokenHeader])
+		assert.Equal(t, "param1=val1&param2=val2", actual["querystring"])
+	})
+
+	t.Run("request body stream errors", func(t *testing.T) {
+		req := invokev1.NewInvokeMethodRequest("method").
+			WithHTTPExtension(http.MethodPost, "param1=val1&param2=val2").
+			WithRawData(&daprt.ErrorReader{})
+		defer req.Close()
+
+		response, err := c.InvokeMethod(ctx, req, "")
+		require.Error(t, err)
+		require.ErrorIs(t, err, io.ErrClosedPipe)
+		if response != nil {
+			defer response.Close()
+		}
+	})
 }
 
 func TestHealthProbe(t *testing.T) {
 	conn := createConnection(t)
-	c := Channel{baseAddress: "localhost:9998", client: conn, appMetadataToken: "token1", maxRequestBodySize: 4, readBufferSize: 4}
+	c := Channel{
+		baseAddress:        "localhost:9998",
+		appCallbackClient:  runtimev1pb.NewAppCallbackClient(conn),
+		conn:               conn,
+		appMetadataToken:   "token1",
+		maxRequestBodySize: 4 << 20,
+	}
 	ctx := context.Background()
 
 	var (
@@ -117,19 +154,23 @@ func TestHealthProbe(t *testing.T) {
 
 	// OK response
 	success, err = c.HealthProbe(ctx)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 	assert.True(t, success)
 
 	// Non-2xx status code
 	mockServer.Error = errors.New("test failure")
 	success, err = c.HealthProbe(ctx)
-	assert.NoError(t, err)
+	require.Error(t, err)
 	assert.False(t, success)
 
 	// Closed connection
-	// Should still return no error, but a failed probe
 	closeConnection(t, conn)
 	success, err = c.HealthProbe(ctx)
-	assert.NoError(t, err)
+	require.Error(t, err)
 	assert.False(t, success)
+}
+
+func TestCreateLocalChannelWithBaseAddress(t *testing.T) {
+	ch := CreateLocalChannel(8080, 1, nil, config.TracingSpec{}, 1024, 1, "my.app")
+	assert.Equal(t, "my.app:8080", ch.baseAddress)
 }

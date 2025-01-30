@@ -16,8 +16,7 @@ package encryption
 import (
 	"bytes"
 	b64 "encoding/base64"
-
-	"github.com/pkg/errors"
+	"fmt"
 )
 
 var encryptedStateStores = map[string]ComponentEncryptionKeys{}
@@ -59,13 +58,17 @@ func TryEncryptValue(storeName string, value []byte) ([]byte, error) {
 // TryDecryptValue will try to decrypt a byte array if the state store has associated encryption keys.
 // If no encryption keys exist, the function will return the bytes unmodified.
 func TryDecryptValue(storeName string, value []byte) ([]byte, error) {
+	if len(value) == 0 {
+		return []byte(""), nil
+	}
+
 	keys := encryptedStateStores[storeName]
 	// extract the decryption key that should be appended to the value
 	ind := bytes.LastIndex(value, []byte(separator))
 	keyName := string(value[ind+len(separator):])
 
 	if len(keyName) == 0 {
-		return value, errors.Errorf("could not decrypt data for state store %s: encryption key name not found on record", storeName)
+		return value, fmt.Errorf("could not decrypt data for state store %s: encryption key name not found on record", storeName)
 	}
 
 	var key Key

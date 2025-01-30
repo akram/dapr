@@ -15,10 +15,12 @@ package kubernetes
 
 import (
 	"context"
+	"log"
 
 	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	commonapi "github.com/dapr/dapr/pkg/apis/common"
 	v1alpha1 "github.com/dapr/dapr/pkg/apis/components/v1alpha1"
 )
 
@@ -38,28 +40,49 @@ func NewDaprComponent(client *KubeClient, ns string, comp ComponentDescription) 
 	}
 }
 
-func (do *DaprComponent) addComponent() (*v1alpha1.Component, error) {
-	client := do.kubeClient.DaprComponents(DaprTestNamespace)
-
-	metadata := []v1alpha1.MetadataItem{}
+// toComponentSpec builds the componentSpec for the given ComponentDescription
+func (do *DaprComponent) toComponentSpec() *v1alpha1.Component {
+	metadata := []commonapi.NameValuePair{}
 
 	for k, v := range do.component.MetaData {
-		metadata = append(metadata, v1alpha1.MetadataItem{
-			Name: k,
-			Value: v1alpha1.DynamicValue{
-				JSON: v1.JSON{
-					Raw: []byte(v),
+		var item commonapi.NameValuePair
+
+		if v.FromSecretRef == nil {
+			item = commonapi.NameValuePair{
+				Name: k,
+				Value: commonapi.DynamicValue{
+					JSON: v1.JSON{
+						Raw: []byte(v.Raw),
+					},
 				},
-			},
-		})
+			}
+		} else {
+			item = commonapi.NameValuePair{
+				Name: k,
+				SecretKeyRef: commonapi.SecretKeyRef{
+					Name: v.FromSecretRef.Name,
+					Key:  v.FromSecretRef.Key,
+				},
+			}
+		}
+		metadata = append(metadata, item)
 	}
 
-	obj := buildDaprComponentObject(do.component.Name, do.component.TypeName, metadata)
-	return client.Create(obj)
+	annotations := make(map[string]string)
+	if do.component.ContainerAsJSON != "" {
+		annotations["dapr.io/component-container"] = do.component.ContainerAsJSON
+	}
+
+	return buildDaprComponentObject(do.component.Name, do.component.TypeName, do.component.Scopes, annotations, metadata)
+}
+
+func (do *DaprComponent) addComponent() (*v1alpha1.Component, error) {
+	log.Printf("Adding component %q ...", do.Name())
+	return do.kubeClient.DaprComponents(do.namespace).Create(do.toComponentSpec())
 }
 
 func (do *DaprComponent) deleteComponent() error {
-	client := do.kubeClient.DaprComponents(DaprTestNamespace)
+	client := do.kubeClient.DaprComponents(do.namespace)
 	return client.Delete(do.component.Name, &metav1.DeleteOptions{})
 }
 
@@ -68,6 +91,9 @@ func (do *DaprComponent) Name() string {
 }
 
 func (do *DaprComponent) Init(ctx context.Context) error {
+	// Ignore errors here as the component may not exist
+	_ = do.Dispose(true)
+
 	_, err := do.addComponent()
 	return err
 }

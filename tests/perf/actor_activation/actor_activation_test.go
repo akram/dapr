@@ -27,6 +27,7 @@ import (
 	"github.com/dapr/dapr/tests/perf/utils"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 	"github.com/dapr/dapr/tests/runner"
+	"github.com/dapr/dapr/tests/runner/summary"
 	"github.com/stretchr/testify/require"
 )
 
@@ -92,7 +93,12 @@ func TestMain(m *testing.M) {
 }
 
 func TestActorActivate(t *testing.T) {
-	p := perf.Params()
+	p := perf.Params(
+		perf.WithQPS(500),
+		perf.WithConnections(8),
+		perf.WithDuration("1m"),
+		perf.WithPayload("{}"),
+	)
 
 	// Get the ingress external url of test app
 	testAppURL := tr.Platform.AcquireAppExternalURL(serviceApplicationName)
@@ -157,17 +163,18 @@ func TestActorActivate(t *testing.T) {
 	}
 	t.Logf("Actual QPS: %.2f, expected QPS: %d", daprResult.ActualQPS, p.QPS)
 
-	report := perf.NewTestReport(
-		[]perf.TestResult{daprResult},
-		"Actor Activation",
-		sidecarUsage,
-		appUsage)
-	report.SetTotalRestartCount(restarts)
-	err = utils.UploadAzureBlob(report)
-
-	if err != nil {
-		t.Error(err)
-	}
+	summary.ForTest(t).
+		Service(serviceApplicationName).
+		Client(clientApplicationName).
+		CPU(appUsage.CPUm).
+		Memory(appUsage.MemoryMb).
+		SidecarCPU(sidecarUsage.CPUm).
+		SidecarMemory(sidecarUsage.MemoryMb).
+		Restarts(restarts).
+		ActualQPS(daprResult.ActualQPS).
+		Params(p).
+		OutputFortio(daprResult).
+		Flush()
 
 	require.Equal(t, 0, daprResult.RetCodes.Num400)
 	require.Equal(t, 0, daprResult.RetCodes.Num500)

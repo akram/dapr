@@ -53,16 +53,18 @@ func TestMain(m *testing.M) {
 		{
 			Name:     "local-secret-store",
 			TypeName: "secretstores.local.file",
-			MetaData: map[string]string{
-				"secretsFile": `"/tmp/testdata/secrets.json"`,
+			MetaData: map[string]kube.MetadataValue{
+				"secretsFile": {Raw: `"/tmp/testdata/secrets.json"`},
 			},
+			Scopes: []string{appName},
 		},
 		{
 			Name:     "secured-binding",
 			TypeName: "bindings.http",
-			MetaData: map[string]string{
-				"url": `"https://localhost:3001"`,
+			MetaData: map[string]kube.MetadataValue{
+				"url": {Raw: `"https://localhost:3001"`},
 			},
+			Scopes: []string{appName},
 		},
 	}
 
@@ -98,7 +100,7 @@ func TestMain(m *testing.M) {
 			InitContainers: []apiv1.Container{
 				{
 					Name:            fmt.Sprintf("%s-init", appName),
-					Image:           fmt.Sprintf("%s/e2e-%s-init:%s", imageRegistry(), appName, imageTag()),
+					Image:           runner.BuildTestImageName(fmt.Sprintf("e2e-%s-init", appName)),
 					ImagePullPolicy: apiv1.PullAlways,
 					VolumeMounts: []apiv1.VolumeMount{
 						{
@@ -160,20 +162,4 @@ func TestDaprSslCertInstallation(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Equal(t, 200, statusCode)
-}
-
-func imageRegistry() string {
-	reg := os.Getenv("DAPR_TEST_REGISTRY")
-	if reg == "" {
-		return "docker.io/dapriotest"
-	}
-	return reg
-}
-
-func imageTag() string {
-	tag := os.Getenv("DAPR_TEST_TAG")
-	if tag == "" {
-		return "latest"
-	}
-	return tag
 }

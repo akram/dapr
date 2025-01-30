@@ -15,6 +15,11 @@ package resiliency
 
 import (
 	"context"
+	"errors"
+	"fmt"
+	"io"
+	"reflect"
+	"sync/atomic"
 	"time"
 
 	"github.com/cenkalti/backoff/v4"
@@ -26,65 +31,235 @@ import (
 
 type (
 	// Operation represents a function to invoke with resiliency policies applied.
-	Operation func(ctx context.Context) error
+	Operation[T any] func(ctx context.Context) (T, error)
 
 	// Runner represents a function to invoke `oper` with resiliency policies applied.
-	Runner func(oper Operation) error
+	Runner[T any] func(oper Operation[T]) (T, error)
 )
 
-// Policy returns a policy runner that encapsulates the configured
-// resiliency policies in a simple execution wrapper.
-func Policy(ctx context.Context, log logger.Logger, operationName string, t time.Duration, r *retry.Config, cb *breaker.CircuitBreaker) Runner {
-	return func(oper Operation) error {
+type doneCh[T any] struct {
+	res T
+	err error
+}
+
+type attemptsCtxKey struct{}
+
+// PolicyDefinition contains a definition for a policy, used to create a Runner.
+type PolicyDefinition struct {
+	log                       logger.Logger
+	name                      string
+	t                         time.Duration
+	r                         *Retry
+	cb                        *breaker.CircuitBreaker
+	addTimeoutActivatedMetric func()
+	addRetryActivatedMetric   func()
+	addCBStateChangedMetric   func()
+}
+
+// NewPolicyDefinition returns a PolicyDefinition object with the given parameters.
+func NewPolicyDefinition(log logger.Logger, name string, t time.Duration, r *Retry, cb *breaker.CircuitBreaker) *PolicyDefinition {
+	return &PolicyDefinition{
+		log:  log,
+		name: name,
+		t:    t,
+		r:    r,
+		cb:   cb,
+	}
+}
+
+// String implements fmt.Stringer and is used for debugging.
+func (p PolicyDefinition) String() string {
+	return fmt.Sprintf(
+		"Policy: name='%s' timeout='%v' retry=(%v) circuitBreaker=(%v)",
+		p.name, p.t, p.r, p.cb,
+	)
+}
+
+// HasRetries returns true if the policy is configured to have more than 1 retry.
+func (p PolicyDefinition) HasRetries() bool {
+	return p.r != nil && p.r.MaxRetries != 0
+}
+
+type RunnerOpts[T any] struct {
+	// The disposer is a function which is invoked when the operation fails, including due to timing out in a background goroutine. It receives the value returned by the operation function as long as it's non-zero (e.g. non-nil for pointer types).
+	// The disposer can be used to perform cleanup tasks on values returned by the operation function that would otherwise leak (because they're not returned by the result of the runner).
+	Disposer func(T)
+
+	// The accumulator is a function that is invoked synchronously when an operation completes without timing out, whether successfully or not. It receives the value returned by the operation function as long as it's non-zero (e.g. non-nil for pointer types).
+	// The accumulator can be used to collect intermediate results and not just the final ones, for example in case of working with batched operations.
+	Accumulator func(T)
+}
+
+// NewRunner returns a policy runner that encapsulates the configured resiliency policies in a simple execution wrapper.
+// We can't implement this as a method of the Resiliency struct because we can't yet use generic methods in structs.
+func NewRunner[T any](ctx context.Context, def *PolicyDefinition) Runner[T] {
+	return NewRunnerWithOptions(ctx, def, RunnerOpts[T]{})
+}
+
+// NewRunnerWithOptions is like NewRunner but allows setting additional options
+func NewRunnerWithOptions[T any](ctx context.Context, def *PolicyDefinition, opts RunnerOpts[T]) Runner[T] {
+	if def == nil {
+		return func(oper Operation[T]) (T, error) {
+			rRes, rErr := oper(ctx)
+			if opts.Accumulator != nil && !isZero(rRes) {
+				opts.Accumulator(rRes)
+			}
+			return rRes, rErr
+		}
+	}
+
+	var zero T
+	timeoutMetricsActivated := atomic.Bool{}
+	return func(oper Operation[T]) (T, error) {
 		operation := oper
-		if t > 0 {
-			// Handle timeout.
-			// TODO: This should ideally be handled by the underlying service/component. Revisit once those understand contexts.
+		if def.t > 0 {
+			// Handle timeout
 			operCopy := operation
-			operation = func(ctx context.Context) error {
-				ctx, cancel := context.WithTimeout(ctx, t)
+			operation = func(ctx context.Context) (T, error) {
+				ctx, cancel := context.WithTimeout(ctx, def.t)
 				defer cancel()
 
-				done := make(chan error, 1)
+				done := make(chan doneCh[T], 1)
 				go func() {
-					done <- operCopy(ctx)
+					rRes, rErr := operCopy(ctx)
+
+					// If the channel is full, it means we had a timeout
+					select {
+					case done <- doneCh[T]{rRes, rErr}:
+						// No timeout, all good
+					default:
+						// The operation has timed out
+						// Invoke the disposer if we have a non-zero return value
+						// Note that in case of timeouts we do not invoke the accumulator
+						if opts.Disposer != nil && !isZero(rRes) {
+							opts.Disposer(rRes)
+						}
+					}
 				}()
 
 				select {
-				case err := <-done:
-					return err
+				case v := <-done:
+					return v.res, v.err
 				case <-ctx.Done():
-					return ctx.Err()
+					// Because done has a capacity of 1, adding a message on the channel signals that there was a timeout
+					// However, the response may have arrived in the meanwhile, so we need to also check if something was added
+					select {
+					case done <- doneCh[T]{}:
+						// All good, nothing to do here
+					default:
+						// The response arrived at the same time as the context deadline, and the channel has a message
+						v := <-done
+
+						// Invoke the disposer if the return value is non-zero
+						// Note that in case of timeouts we do not invoke the accumulator
+						if opts.Disposer != nil && !isZero(v.res) {
+							opts.Disposer(v.res)
+						}
+					}
+					if def.addTimeoutActivatedMetric != nil && timeoutMetricsActivated.CompareAndSwap(false, true) {
+						def.addTimeoutActivatedMetric()
+					}
+					return zero, ctx.Err()
 				}
 			}
 		}
 
-		if cb != nil {
+		if opts.Accumulator != nil {
 			operCopy := operation
-			operation = func(ctx context.Context) error {
-				err := cb.Execute(func() error {
+			operation = func(ctx context.Context) (T, error) {
+				rRes, rErr := operCopy(ctx)
+				if !isZero(rRes) {
+					opts.Accumulator(rRes)
+				}
+				return rRes, rErr
+			}
+		}
+
+		if def.cb != nil {
+			operCopy := operation
+			operation = func(ctx context.Context) (T, error) {
+				prevState := def.cb.State()
+				resAny, err := def.cb.Execute(func() (any, error) {
 					return operCopy(ctx)
 				})
-				if r != nil && breaker.IsErrorPermanent(err) {
-					// Break out of retry.
+				if def.addCBStateChangedMetric != nil && prevState != def.cb.State() {
+					def.addCBStateChangedMetric()
+				}
+				if def.r != nil && breaker.IsErrorPermanent(err) {
+					// Break out of retry
 					err = backoff.Permanent(err)
 				}
-				return err
+				res, ok := resAny.(T)
+				if !ok && resAny != nil {
+					err = errors.New("cannot cast response to specific type")
+					if def.r != nil {
+						// Break out of retry
+						err = backoff.Permanent(err)
+					}
+				}
+				return res, err
 			}
 		}
 
-		if r == nil {
+		if def.r == nil {
 			return operation(ctx)
 		}
 
-		// Use retry/back off.
-		b := r.NewBackOffWithContext(ctx)
-		return retry.NotifyRecover(func() error {
-			return operation(ctx)
-		}, b, func(_ error, _ time.Duration) {
-			log.Infof("Error processing operation %s. Retrying...", operationName)
-		}, func() {
-			log.Infof("Recovered processing operation %s.", operationName)
-		})
+		// Use retry/back off
+		b := def.r.NewBackOffWithContext(ctx)
+		attempts := atomic.Int32{}
+		return retry.NotifyRecoverWithData(
+			func() (T, error) {
+				attempt := attempts.Add(1)
+				opCtx := context.WithValue(ctx, attemptsCtxKey{}, attempt)
+				rRes, rErr := operation(opCtx)
+				// In case of an error, if we have a disposer we invoke it with the return value, then reset the return value
+				if rErr != nil && opts.Disposer != nil && !isZero(rRes) {
+					opts.Disposer(rRes)
+					rRes = zero
+				}
+				var cErr CodeError
+				if errors.As(rErr, &cErr) {
+					if def.r.statusCodeNeedRetry(cErr.StatusCode) {
+						return rRes, rErr
+					} else {
+						return rRes, backoff.Permanent(rErr)
+					}
+				}
+				return rRes, rErr
+			},
+			b,
+			func(opErr error, d time.Duration) {
+				if def.addRetryActivatedMetric != nil {
+					def.addRetryActivatedMetric()
+				}
+				def.log.Warnf("Error processing operation %s. Retrying in %v…", def.name, d)
+				def.log.Debugf("Error for operation %s was: %v", def.name, opErr)
+			},
+			func() {
+				def.log.Infof("Recovered processing operation %s after %d attempts", def.name, attempts.Load())
+			},
+		)
 	}
+}
+
+// DisposerCloser is a Disposer function for RunnerOpts that invokes Close() on the object.
+func DisposerCloser[T io.Closer](obj T) {
+	_ = obj.Close()
+}
+
+// GetAttempt returns the attempt number from a context
+// Attempts are numbered from 1 onwards.
+// If the context doesn't have an attempt number, returns 0
+func GetAttempt(ctx context.Context) int32 {
+	v := ctx.Value(attemptsCtxKey{})
+	attempt, ok := v.(int32)
+	if !ok {
+		return 0
+	}
+	return attempt
+}
+
+func isZero(val any) bool {
+	return reflect.ValueOf(val).IsZero()
 }

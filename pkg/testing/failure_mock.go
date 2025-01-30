@@ -17,35 +17,57 @@ import (
 	"errors"
 	"sync"
 	"time"
+
+	"k8s.io/utils/clock"
 )
 
+func NewFailure(fails map[string]int, timeouts map[string]time.Duration, callCount map[string]int) Failure {
+	return newFailureWithClock(fails, timeouts, callCount, &clock.RealClock{})
+}
+
+func newFailureWithClock(fails map[string]int, timeouts map[string]time.Duration, callCount map[string]int, clock clock.Clock) Failure {
+	return Failure{
+		fails:     fails,
+		timeouts:  timeouts,
+		callCount: callCount,
+		lock:      &sync.RWMutex{},
+		clock:     clock,
+	}
+}
+
 type Failure struct {
-	Fails     map[string]int
-	Timeouts  map[string]time.Duration
-	CallCount map[string]int
-	lock      *sync.Mutex
+	fails     map[string]int
+	timeouts  map[string]time.Duration
+	callCount map[string]int
+	lock      *sync.RWMutex
+	clock     clock.Clock
 }
 
 func (f *Failure) PerformFailure(key string) error {
-	if f.lock == nil {
-		f.lock = &sync.Mutex{}
-	}
 	f.lock.Lock()
-	f.CallCount[key]++
-	f.lock.Unlock()
-	if val, ok := f.Fails[key]; ok {
-		if val > 0 {
-			f.lock.Lock()
-			f.Fails[key]--
+
+	f.callCount[key]++
+
+	if v, ok := f.fails[key]; ok {
+		if v > 0 {
+			f.fails[key]--
 			f.lock.Unlock()
 			return errors.New("forced failure")
 		}
-		delete(f.Fails, key)
+		delete(f.fails, key)
+		f.lock.Unlock()
 		return nil
 	}
+	f.lock.Unlock()
 
-	if val, ok := f.Timeouts[key]; ok {
-		time.Sleep(val)
+	if val, ok := f.timeouts[key]; ok {
+		f.clock.Sleep(val)
 	}
 	return nil
+}
+
+func (f *Failure) CallCount(key string) int {
+	f.lock.RLock()
+	defer f.lock.RUnlock()
+	return f.callCount[key]
 }

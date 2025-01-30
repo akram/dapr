@@ -31,6 +31,8 @@ import (
 	"time"
 
 	"github.com/gorilla/mux"
+	"golang.org/x/net/http2"
+	"golang.org/x/net/http2/h2c"
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/emptypb"
@@ -70,6 +72,11 @@ func main() {
 
 	appProtocol = os.Getenv("APP_PROTOCOL")
 
+	expectAppProtocol := os.Getenv("EXPECT_APP_PROTOCOL")
+	if expectAppProtocol != "" && appProtocol != expectAppProtocol {
+		log.Fatalf("Expected injected APP_PROTOCOL to be %q, but got %q", expectAppProtocol, appProtocol)
+	}
+
 	controlPort = os.Getenv("CONTROL_PORT")
 	if controlPort == "" {
 		controlPort = "3000"
@@ -87,12 +94,19 @@ func main() {
 		startPublishing(ctx)
 	}()
 
-	if appProtocol == "grpc" {
+	switch appProtocol {
+	case "grpc":
+		log.Println("using gRPC")
 		// Blocking call
 		startGRPC()
-	} else {
+	case "http":
+		log.Println("using HTTP")
 		// Blocking call
 		startHTTP()
+	case "h2c":
+		log.Println("using H2C")
+		// Blocking call
+		startH2C()
 	}
 
 	cancel()
@@ -164,12 +178,12 @@ func (c *countAndLast) MarshalJSON() ([]byte, error) {
 
 func startControlServer() {
 	// Wait until the first health probe
-	log.Print("Waiting for signalto start control server…")
+	log.Print("Waiting for signal to start control server…")
 	<-ready
 
 	port, _ := strconv.Atoi(controlPort)
 	log.Printf("Health App control server listening on http://:%d", port)
-	utils.StartServer(port, func() *mux.Router {
+	utils.StartServer(port, func() http.Handler {
 		r := mux.NewRouter().StrictSlash(true)
 
 		// Log requests and their processing time
@@ -279,7 +293,38 @@ func startHTTP() {
 	utils.StartServer(port, httpRouter, true, false)
 }
 
-func httpRouter() *mux.Router {
+func startH2C() {
+	log.Printf("Health App HTTP/2 Cleartext server listening on http://:%s", appPort)
+
+	h2s := &http2.Server{}
+	srv := &http.Server{
+		Addr:              ":" + appPort,
+		Handler:           h2c.NewHandler(httpRouter(), h2s),
+		ReadHeaderTimeout: 30 * time.Second,
+	}
+
+	// Stop the server when we get a termination signal
+	stopCh := make(chan os.Signal, 1)
+	signal.Notify(stopCh, syscall.SIGKILL, syscall.SIGTERM, syscall.SIGINT) //nolint:staticcheck
+	go func() {
+		// Wait for cancelation signal
+		<-stopCh
+		log.Println("Shutdown signal received")
+		ctx, cancel := context.WithTimeout(context.Background(), 1*time.Second)
+		defer cancel()
+		srv.Shutdown(ctx)
+	}()
+
+	// Blocking call
+	err := srv.ListenAndServe()
+	if err != http.ErrServerClosed {
+		log.Fatalf("Failed to run server: %v", err)
+	}
+
+	log.Println("Server shut down")
+}
+
+func httpRouter() http.Handler {
 	r := mux.NewRouter().StrictSlash(true)
 
 	// Log requests and their processing time
@@ -367,8 +412,8 @@ func (s *grpcServer) HealthCheck(ctx context.Context, _ *emptypb.Empty) (*runtim
 }
 
 func (s *grpcServer) OnInvoke(_ context.Context, in *commonv1pb.InvokeRequest) (*commonv1pb.InvokeResponse, error) {
-	if in.Method == "foo" {
-		log.Println("Received method invocation: " + in.Method)
+	if in.GetMethod() == "foo" {
+		log.Println("Received method invocation: " + in.GetMethod())
 		return &commonv1pb.InvokeResponse{
 			Data: &anypb.Any{
 				Value: []byte("🤗"),
@@ -376,12 +421,12 @@ func (s *grpcServer) OnInvoke(_ context.Context, in *commonv1pb.InvokeRequest) (
 		}, nil
 	}
 
-	return nil, errors.New("unexpected method invocation: " + in.Method)
+	return nil, errors.New("unexpected method invocation: " + in.GetMethod())
 }
 
 func (s *grpcServer) ListTopicSubscriptions(_ context.Context, in *emptypb.Empty) (*runtimev1pb.ListTopicSubscriptionsResponse, error) {
 	return &runtimev1pb.ListTopicSubscriptionsResponse{
-		Subscriptions: []*commonv1pb.TopicSubscription{
+		Subscriptions: []*runtimev1pb.TopicSubscription{
 			{
 				PubsubName: "inmemorypubsub",
 				Topic:      "mytopic",
@@ -391,13 +436,13 @@ func (s *grpcServer) ListTopicSubscriptions(_ context.Context, in *emptypb.Empty
 }
 
 func (s *grpcServer) OnTopicEvent(_ context.Context, in *runtimev1pb.TopicEventRequest) (*runtimev1pb.TopicEventResponse, error) {
-	if in.Topic == "mytopic" {
-		log.Println("Received topic event: " + in.Topic)
+	if in.GetTopic() == "mytopic" {
+		log.Println("Received topic event: " + in.GetTopic())
 		lastTopicMessage.Record()
 		return &runtimev1pb.TopicEventResponse{}, nil
 	}
 
-	return nil, errors.New("unexpected topic event: " + in.Topic)
+	return nil, errors.New("unexpected topic event: " + in.GetTopic())
 }
 
 func (s *grpcServer) ListInputBindings(_ context.Context, in *emptypb.Empty) (*runtimev1pb.ListInputBindingsResponse, error) {
@@ -407,13 +452,13 @@ func (s *grpcServer) ListInputBindings(_ context.Context, in *emptypb.Empty) (*r
 }
 
 func (s *grpcServer) OnBindingEvent(_ context.Context, in *runtimev1pb.BindingEventRequest) (*runtimev1pb.BindingEventResponse, error) {
-	if in.Name == "schedule" {
-		log.Println("Received binding event: " + in.Name)
+	if in.GetName() == "schedule" {
+		log.Println("Received binding event: " + in.GetName())
 		lastInputBinding.Record()
 		return &runtimev1pb.BindingEventResponse{}, nil
 	}
 
-	return nil, errors.New("unexpected binding event: " + in.Name)
+	return nil, errors.New("unexpected binding event: " + in.GetName())
 }
 
 type healthCheck struct {

@@ -18,6 +18,9 @@ import (
 
 	"go.opencensus.io/stats/view"
 	"go.opencensus.io/tag"
+
+	"github.com/dapr/dapr/pkg/config"
+	"github.com/dapr/dapr/pkg/diagnostics/utils"
 )
 
 // appIDKey is a tag key for App ID.
@@ -37,23 +40,36 @@ var (
 	DefaultComponentMonitoring = newComponentMetrics()
 	// DefaultResiliencyMonitoring holds resiliency specific metrics.
 	DefaultResiliencyMonitoring = newResiliencyMetrics()
+	// DefaultWorkflowMonitoring holds workflow specific metrics.
+	DefaultWorkflowMonitoring = newWorkflowMetrics()
+	// DefaultErrorCodeMonitoring holds error code specific metrics.
+	DefaultErrorCodeMonitoring = newErrorCodeMetrics()
 )
 
+// <<10 -> KBs; <<20 -> MBs; <<30 -> GBs
+var defaultSizeDistribution = view.Distribution(1<<10, 2<<10, 4<<10, 16<<10, 64<<10, 256<<10, 1<<20, 4<<20, 16<<20, 64<<20, 256<<20, 1<<30, 4<<30)
+
 // InitMetrics initializes metrics.
-func InitMetrics(appID, namespace string) error {
-	if err := DefaultMonitoring.Init(appID); err != nil {
+func InitMetrics(appID, namespace string, metricSpec config.MetricSpec) error {
+	latencyDistribution := metricSpec.GetLatencyDistribution(log)
+	if err := DefaultMonitoring.Init(appID, latencyDistribution); err != nil {
 		return err
 	}
 
-	if err := DefaultGRPCMonitoring.Init(appID); err != nil {
+	if err := DefaultGRPCMonitoring.Init(appID, latencyDistribution); err != nil {
 		return err
 	}
 
-	if err := DefaultHTTPMonitoring.Init(appID); err != nil {
+	httpConfig := NewHTTPMonitoringConfig(
+		metricSpec.GetHTTPPathMatching(),
+		metricSpec.GetHTTPIncreasedCardinality(log),
+		metricSpec.GetHTTPExcludeVerbs(),
+	)
+	if err := DefaultHTTPMonitoring.Init(appID, httpConfig, latencyDistribution); err != nil {
 		return err
 	}
 
-	if err := DefaultComponentMonitoring.Init(appID, namespace); err != nil {
+	if err := DefaultComponentMonitoring.Init(appID, namespace, latencyDistribution); err != nil {
 		return err
 	}
 
@@ -61,8 +77,17 @@ func InitMetrics(appID, namespace string) error {
 		return err
 	}
 
+	if err := DefaultWorkflowMonitoring.Init(appID, namespace, latencyDistribution); err != nil {
+		return err
+	}
+
+	if metricSpec.GetRecordErrorCodes() {
+		if err := DefaultErrorCodeMonitoring.Init(appID); err != nil {
+			return err
+		}
+	}
+
 	// Set reporting period of views
 	view.SetReportingPeriod(DefaultReportingPeriod)
-
-	return nil
+	return utils.CreateRulesMap(metricSpec.Rules)
 }

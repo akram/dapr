@@ -14,10 +14,17 @@ limitations under the License.
 package v1alpha1
 
 import (
-	"strconv"
-
-	v1 "k8s.io/apiextensions-apiserver/pkg/apis/apiextensions/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/dapr/dapr/pkg/apis/common"
+	"github.com/dapr/dapr/pkg/apis/components"
+	"github.com/dapr/dapr/utils"
+)
+
+const (
+	Kind    = "Component"
+	Version = "v1alpha1"
 )
 
 //+genclient
@@ -32,9 +39,8 @@ type Component struct {
 	//+optional
 	Spec ComponentSpec `json:"spec,omitempty"`
 	//+optional
-	Auth `json:"auth,omitempty"`
-	//+optional
-	Scopes []string `json:"scopes,omitempty"`
+	Auth          `json:"auth,omitempty"`
+	common.Scoped `json:",inline"`
 }
 
 // Kind returns the component kind.
@@ -42,29 +48,53 @@ func (Component) Kind() string {
 	return "Component"
 }
 
-//+genclient
-//+genclient:noStatus
-//+kubebuilder:object:root=true
-
-// PluggableComponent is a especification for a pluggable component.
-type PluggableComponent struct {
-	metav1.TypeMeta `json:",inline"`
-	//+optional
-	metav1.ObjectMeta `json:"metadata,omitempty"`
-	//+optional
-	Scopes []string               `json:"scopes,omitempty"`
-	Spec   PluggableComponentSpec `json:"spec,omitempty"`
+func (Component) APIVersion() string {
+	return components.GroupName + "/" + Version
 }
 
-// Kind returns the component kind.
-func (PluggableComponent) Kind() string {
-	return "PluggableComponent"
+// GetName returns the component name.
+func (c Component) GetName() string {
+	return c.Name
 }
 
-// PluggableComponentSpec is the spec for a pluggable component.
-type PluggableComponentSpec struct {
-	Type    string `json:"type"`
-	Version string `json:"version"`
+// GetNamespace returns the component namespace.
+func (c Component) GetNamespace() string {
+	return c.Namespace
+}
+
+// LogName returns the name of the component that can be used in logging.
+func (c Component) LogName() string {
+	return utils.ComponentLogName(c.ObjectMeta.Name, c.Spec.Type, c.Spec.Version)
+}
+
+// GetSecretStore returns the name of the secret store.
+func (c Component) GetSecretStore() string {
+	return c.Auth.SecretStore
+}
+
+// NameValuePairs returns the component's metadata as name/value pairs
+func (c Component) NameValuePairs() []common.NameValuePair {
+	return c.Spec.Metadata
+}
+
+func (c Component) ClientObject() client.Object {
+	return &c
+}
+
+func (c Component) GetScopes() []string {
+	return c.Scopes
+}
+
+// EmptyMetaDeepCopy returns a new instance of the component type with the
+// TypeMeta's Kind and APIVersion fields set.
+func (c Component) EmptyMetaDeepCopy() metav1.Object {
+	n := c.DeepCopy()
+	n.TypeMeta = metav1.TypeMeta{
+		Kind:       Kind,
+		APIVersion: components.GroupName + "/" + Version,
+	}
+	n.ObjectMeta = metav1.ObjectMeta{Name: c.Name}
+	return n
 }
 
 // ComponentSpec is the spec for a component.
@@ -72,25 +102,10 @@ type ComponentSpec struct {
 	Type    string `json:"type"`
 	Version string `json:"version"`
 	//+optional
-	IgnoreErrors bool           `json:"ignoreErrors"`
-	Metadata     []MetadataItem `json:"metadata"`
+	IgnoreErrors bool                   `json:"ignoreErrors"`
+	Metadata     []common.NameValuePair `json:"metadata"`
 	//+optional
 	InitTimeout string `json:"initTimeout"`
-}
-
-// MetadataItem is a name/value pair for a metadata.
-type MetadataItem struct {
-	Name string `json:"name"`
-	//+optional
-	Value DynamicValue `json:"value,omitempty"`
-	//+optional
-	SecretKeyRef SecretKeyRef `json:"secretKeyRef,omitempty"`
-}
-
-// SecretKeyRef is a reference to a secret holding the value for the metadata item. Name is the secret name, and key is the field in the secret.
-type SecretKeyRef struct {
-	Name string `json:"name"`
-	Key  string `json:"key"`
 }
 
 // Auth represents authentication details for the component.
@@ -106,20 +121,4 @@ type ComponentList struct {
 	metav1.ListMeta `json:"metadata"`
 
 	Items []Component `json:"items"`
-}
-
-// DynamicValue is a dynamic value struct for the component.metadata pair value.
-type DynamicValue struct {
-	v1.JSON `json:",inline"`
-}
-
-// String returns the string representation of the raw value.
-// If the value is a string, it will be unquoted as the string is guaranteed to be a JSON serialized string.
-func (d *DynamicValue) String() string {
-	s := string(d.Raw)
-	c, err := strconv.Unquote(s)
-	if err == nil {
-		s = c
-	}
-	return s
 }

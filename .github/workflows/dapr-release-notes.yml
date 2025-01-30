@@ -15,13 +15,18 @@ name: dapr-release-notes
 
 on:
   workflow_dispatch:
+
+permissions: {}
+
 jobs:
   build:
     name: Generate release notes
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - name: Checkout repo
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
       - name: Install dependencies
         run: pip install PyGithub
       - name: Generate release notes

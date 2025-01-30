@@ -2,17 +2,34 @@
 <h2>Any language, any framework, anywhere</h2>
 </div>
 
-[![Go Report Card](https://goreportcard.com/badge/github.com/dapr/dapr)](https://goreportcard.com/report/github.com/dapr/dapr)
-[![CII Best Practices](https://bestpractices.coreinfrastructure.org/projects/5044/badge)](https://bestpractices.coreinfrastructure.org/projects/5044)
-[![Docker Pulls](https://img.shields.io/docker/pulls/daprio/daprd)](https://hub.docker.com/r/daprio/dapr)
-[![Build Status](https://github.com/dapr/dapr/workflows/dapr/badge.svg?event=push&branch=master)](https://github.com/dapr/dapr/actions?workflow=dapr)
-[![Scheduled e2e test](https://github.com/dapr/dapr/workflows/dapr-test/badge.svg?event=schedule)](https://github.com/dapr/dapr/actions?workflow=dapr-test)
-[![codecov](https://codecov.io/gh/dapr/dapr/branch/master/graph/badge.svg)](https://codecov.io/gh/dapr/dapr)
-[![Discord](https://img.shields.io/discord/778680217417809931)](https://discord.com/channels/778680217417809931/778680217417809934)
-[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://github.com/dapr/dapr/blob/master/LICENSE)
-[![FOSSA Status](https://app.fossa.com/api/projects/custom%2B162%2Fgithub.com%2Fdapr%2Fdapr.svg?type=shield)](https://app.fossa.com/projects/custom%2B162%2Fgithub.com%2Fdapr%2Fdapr?ref=badge_shield)
-[![TODOs](https://badgen.net/https/api.tickgit.com/badgen/github.com/dapr/dapr)](https://www.tickgit.com/browse?repo=github.com/dapr/dapr)
-[![Follow on Twitter](https://img.shields.io/twitter/follow/daprdev.svg?style=social&logo=twitter)](https://twitter.com/intent/follow?screen_name=daprdev)
+[![Go Report][go-report-badge]][go-report-url] [![OpenSSF][openssf-badge]][openssf-url] [![Docker Pulls][docker-badge]][docker-url] [![Build Status][actions-badge]][actions-url] [![Test Status][e2e-badge]][e2e-url] [![Code Coverage][codecov-badge]][codecov-url] [![License: Apache 2.0][apache-badge]][apache-url] [![FOSSA Status][fossa-badge]][fossa-url] [![TODOs][todo-badge]][todo-url] [![Good First Issues][gfi-badge]][gfi-url] [![discord][discord-badge]][discord-url] [![YouTube][youtube-badge]][youtube-link] [![X/Twitter][x-badge]][x-link]
+
+[go-report-badge]: https://goreportcard.com/badge/github.com/dapr/dapr
+[go-report-url]: https://goreportcard.com/report/github.com/dapr/dapr
+[openssf-badge]: https://www.bestpractices.dev/projects/5044/badge
+[openssf-url]: https://www.bestpractices.dev/projects/5044
+[docker-badge]: https://img.shields.io/docker/pulls/daprio/daprd?style=flat&logo=docker
+[docker-url]: https://hub.docker.com/r/daprio/dapr
+[apache-badge]: https://img.shields.io/github/license/dapr/dapr?style=flat&label=License&logo=github
+[apache-url]: https://github.com/dapr/dapr/blob/master/LICENSE
+[actions-badge]: https://github.com/dapr/dapr/workflows/dapr/badge.svg?event=push&branch=master
+[actions-url]: https://github.com/dapr/dapr/actions?workflow=dapr
+[e2e-badge]: https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/dapr-bot/14e974e8fd6c6eab03a2475beb1d547a/raw/dapr-test-badge.json
+[e2e-url]: https://github.com/dapr/dapr/actions?workflow=dapr-test&event=schedule
+[codecov-badge]: https://codecov.io/gh/dapr/dapr/branch/master/graph/badge.svg
+[codecov-url]: https://codecov.io/gh/dapr/dapr
+[fossa-badge]: https://app.fossa.com/api/projects/custom%2B162%2Fgithub.com%2Fdapr%2Fdapr.svg?type=shield
+[fossa-url]: https://app.fossa.com/projects/custom%2B162%2Fgithub.com%2Fdapr%2Fdapr?ref=badge_shield
+[todo-badge]: https://badgen.net/https/api.tickgit.com/badgen/github.com/dapr/dapr
+[todo-url]: https://www.tickgit.com/browse?repo=github.com/dapr/dapr
+[gfi-badge]:https://img.shields.io/github/issues-search/dapr/dapr?query=type%3Aissue%20is%3Aopen%20label%3A%22good%20first%20issue%22&label=Good%20first%20issues&style=flat&logo=github
+[gfi-url]:https://github.com/dapr/dapr/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22
+[discord-badge]: https://img.shields.io/discord/778680217417809931?label=Discord&style=flat&logo=discord
+[discord-url]: http://bit.ly/dapr-discord
+[youtube-badge]:https://img.shields.io/youtube/channel/views/UCtpSQ9BLB_3EXdWAUQYwnRA?style=flat&label=YouTube%20views&logo=youtube
+[youtube-link]:https://youtube.com/@daprdev
+[x-badge]:https://img.shields.io/twitter/follow/daprdev?logo=x&style=flat
+[x-link]:https://twitter.com/daprdev
 
 Dapr is a portable, serverless, event-driven runtime that makes it easy for developers to build resilient, stateless and stateful microservices that run on the cloud and edge and embraces the diversity of languages and developer frameworks.
 
@@ -20,7 +37,7 @@ Dapr codifies the *best practices* for building microservice applications into o
 
 ![Dapr overview](./img/overview.png)
 
-We are a Cloud Native Computing Foundation (CNCF) incubation project.
+We are a Cloud Native Computing Foundation (CNCF) graduated project.
 <p align="center"><img src="https://raw.githubusercontent.com/kedacore/keda/main/images/logo-cncf.svg" height="75px"></p>
 
 ## Goals
@@ -48,9 +65,9 @@ Dapr uses pluggable component state stores and message buses such as Redis as we
 
 ## Why Dapr?
 
-Writing high performance, scalable and reliable distributed application is hard. Dapr brings proven patterns and practices to you. It unifies event-driven and actors semantics into a simple, consistent programming model. It supports all programming languages without framework lock-in. You are not exposed to low-level primitives such as threading, concurrency control, partitioning and scaling. Instead, you can write your code by implementing a simple web server using familiar web frameworks of your choice.
+Writing highly performant, scalable and reliable distributed application is hard. Dapr brings proven patterns and practices to you. It unifies event-driven and actors semantics into a simple, consistent programming model. It supports all programming languages without framework lock-in. You are not exposed to low-level primitives such as threading, concurrency control, partitioning and scaling. Instead, you can write your code by implementing a simple web server using familiar web frameworks of your choice.
 
-Dapr is flexible in threading and state consistency models. You can leverage multi-threading if you choose to, and you can choose among different consistency models. This flexibility enables to implement advanced scenarios without artificial constraints. Dapr is unique because you can transition seamlessly between platforms and underlying implementations without rewriting your code.
+Dapr is flexible in threading and state consistency models. You can leverage multi-threading if you choose to, and you can choose among different consistency models. This flexibility enables you to implement advanced scenarios without artificial constraints. Dapr is unique because you can transition seamlessly between platforms and underlying implementations without rewriting your code.
 
 ## Features
 
@@ -60,7 +77,7 @@ Dapr is flexible in threading and state consistency models. You can leverage mul
 * Consistent service-to-service discovery and invocation
 * Opt-in stateful models: Strong/Eventual consistency, First-write/Last-write wins
 * Cross platform virtual actors
-* Secrets management to retrieve secrets from secure key vaults
+* Secret management to retrieve secrets from secure key vaults
 * Rate limiting
 * Built-in [Observability](https://docs.dapr.io/concepts/observability-concept/) support
 * Runs natively on Kubernetes using a dedicated Operator and CRDs
@@ -83,7 +100,7 @@ See our [Getting Started](https://docs.dapr.io/getting-started/) guide over in o
 
 ## Community
 We want your contributions and suggestions! One of the easiest ways to contribute is to participate in discussions on the mailing list, chat on IM or the bi-weekly community calls.
-For more information on the community engagement, developer and contributing guidelines and more, head over to the [Dapr community repo](https://github.com/dapr/community#dapr-community)
+For more information on the community engagement, developer and contributing guidelines and more, head over to the [Dapr community repo](https://github.com/dapr/community#dapr-community).
 
 ### Contact Us
 
@@ -118,7 +135,7 @@ See the [Development Guide](https://docs.dapr.io/contributing/) to get started w
 | [Dapr](https://github.com/dapr/dapr) | The main repository that you are currently in. Contains the Dapr runtime code and overview documentation.
 | [CLI](https://github.com/dapr/cli) | The Dapr CLI allows you to setup Dapr on your local dev machine or on a Kubernetes cluster, provides debugging support, launches and manages Dapr instances.
 | [Docs](https://docs.dapr.io) | The documentation for Dapr.
-| [Quickstarts](https://github.com/dapr/quickstarts) | This repository contains a series of simple code samples that highlight the main Dapr capabilities
+| [Quickstarts](https://github.com/dapr/quickstarts) | This repository contains a series of simple code samples that highlight the main Dapr capabilities.
 | [Samples](https://github.com/dapr/samples) | This repository holds community maintained samples for various Dapr use cases.
 | [Components-contrib ](https://github.com/dapr/components-contrib) | The purpose of components contrib is to provide open, community driven reusable components for building distributed applications.
 | [Dashboard ](https://github.com/dapr/dashboard) | General purpose dashboard for Dapr

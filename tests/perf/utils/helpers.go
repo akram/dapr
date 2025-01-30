@@ -19,6 +19,7 @@ package utils
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -32,10 +33,13 @@ import (
 	"github.com/dapr/kit/logger"
 )
 
+// Max number of healthcheck calls before starting tests.
+const numHealthChecks = 60
+
 // SimpleKeyValue can be used to simplify code, providing simple key-value pairs.
 type SimpleKeyValue struct {
-	Key   interface{}
-	Value interface{}
+	Key   any
+	Value any
 }
 
 // GenerateRandomStringKeys generates random string keys (values are nil).
@@ -93,7 +97,7 @@ func UploadAzureBlob(report *perf.TestReport) error {
 	l := logger.NewLogger("dapr-perf-test")
 	azblob := blobstorage.NewAzureBlobStorage(l)
 
-	err = azblob.Init(bindings.Metadata{
+	err = azblob.Init(context.Background(), bindings.Metadata{
 		Base: metadata.Base{
 			Properties: map[string]string{
 				"storageAccount":    accountName,
@@ -119,4 +123,30 @@ func UploadAzureBlob(report *perf.TestReport) error {
 		},
 	})
 	return err
+}
+
+// HealthCheckApps performs healthchecks for multiple apps, waiting for them to be ready.
+func HealthCheckApps(urls ...string) error {
+	count := len(urls)
+	if count == 0 {
+		return nil
+	}
+
+	// Run the checks in parallel
+	errCh := make(chan error, count)
+	for _, u := range urls {
+		go func(u string) {
+			_, err := HTTPGetNTimes(u, numHealthChecks)
+			errCh <- err
+		}(u)
+	}
+
+	// Collect all errors
+	errs := make([]error, count)
+	for i := 0; i < count; i++ {
+		errs[i] = <-errCh
+	}
+
+	// Will be nil if no error
+	return errors.Join(errs...)
 }

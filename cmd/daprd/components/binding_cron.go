@@ -1,3 +1,5 @@
+//go:build allcomponents || stablecomponents
+
 /*
 Copyright 2021 The Dapr Authors
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,17 +16,10 @@ limitations under the License.
 package components
 
 import (
-	"github.com/dapr/components-contrib/bindings"
 	"github.com/dapr/components-contrib/bindings/cron"
 	bindingsLoader "github.com/dapr/dapr/pkg/components/bindings"
-	"github.com/dapr/kit/logger"
 )
 
 func init() {
-	bindingsLoader.DefaultRegistry.RegisterInputBinding(func(l logger.Logger) bindings.InputBinding {
-		return cron.NewCron(l)
-	}, "cron")
-	bindingsLoader.DefaultRegistry.RegisterOutputBinding(func(l logger.Logger) bindings.OutputBinding {
-		return cron.NewCron(l)
-	}, "cron")
+	bindingsLoader.DefaultRegistry.RegisterInputBinding(cron.NewCron, "cron")
 }

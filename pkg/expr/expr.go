@@ -62,6 +62,13 @@ func (e *Expr) DecodeString(value string) (err error) {
 }
 
 func (e *Expr) Eval(variables map[string]interface{}) (interface{}, error) {
+	if e.program == nil {
+		err := e.DecodeString(e.expr)
+		if err != nil {
+			return nil, err
+		}
+	}
+
 	out, _, err := e.program.Eval(variables)
 	if err != nil {
 		return nil, err
@@ -75,6 +82,9 @@ func (e *Expr) Expr() string {
 }
 
 func (e *Expr) String() string {
+	if e == nil {
+		return ""
+	}
 	return e.expr
 }
 

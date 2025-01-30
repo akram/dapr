@@ -6,7 +6,9 @@ Copyright 2021 The Dapr Authors
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
-    http://www.apache.org/licenses/LICENSE-2.0
+
+	http://www.apache.org/licenses/LICENSE-2.0
+
 Unless required by applicable law or agreed to in writing, software
 distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
@@ -27,6 +29,7 @@ import (
 	"github.com/dapr/dapr/tests/perf/utils"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 	"github.com/dapr/dapr/tests/runner"
+	"github.com/dapr/dapr/tests/runner/summary"
 	"github.com/stretchr/testify/require"
 )
 
@@ -90,7 +93,12 @@ func TestMain(m *testing.M) {
 }
 
 func TestActorTimerWithStatePerformance(t *testing.T) {
-	p := perf.Params()
+	p := perf.Params(
+		perf.WithQPS(220),
+		perf.WithConnections(10),
+		perf.WithDuration("1m"),
+		perf.WithPayload("{}"),
+	)
 	// Get the ingress external url of test app
 	testAppURL := tr.Platform.AcquireAppExternalURL(serviceApplicationName)
 	require.NotEmpty(t, testAppURL, "test app external URL must not be empty")
@@ -154,17 +162,18 @@ func TestActorTimerWithStatePerformance(t *testing.T) {
 	}
 	t.Logf("Actual QPS: %.2f, expected QPS: %d", daprResult.ActualQPS, p.QPS)
 
-	report := perf.NewTestReport(
-		[]perf.TestResult{daprResult},
-		"Actor Timer",
-		sidecarUsage,
-		appUsage)
-	report.SetTotalRestartCount(restarts)
-	err = utils.UploadAzureBlob(report)
-
-	if err != nil {
-		t.Error(err)
-	}
+	summary.ForTest(t).
+		Service(serviceApplicationName).
+		Client(clientApplicationName).
+		CPU(appUsage.CPUm).
+		Memory(appUsage.MemoryMb).
+		SidecarCPU(sidecarUsage.CPUm).
+		SidecarMemory(sidecarUsage.MemoryMb).
+		Restarts(restarts).
+		ActualQPS(daprResult.ActualQPS).
+		Params(p).
+		OutputFortio(daprResult).
+		Flush()
 
 	require.Equal(t, 0, daprResult.RetCodes.Num400)
 	require.Equal(t, 0, daprResult.RetCodes.Num500)

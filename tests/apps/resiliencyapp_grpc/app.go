@@ -80,7 +80,10 @@ func (s *server) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloRe
 			time.Sleep(*message.Timeout)
 		} else {
 			log.Println("Forcing failure.")
-			return nil, errors.New("forced failure")
+			if message.ResponseCode == nil {
+				return nil, errors.New("forced failure")
+			}
+			return nil, grpc.Errorf(grpccodes.Code(*message.ResponseCode), "forced failure with status code %d", *message.ResponseCode)
 		}
 	}
 	return &pb.HelloReply{Message: "Hello"}, nil
@@ -88,14 +91,14 @@ func (s *server) SayHello(ctx context.Context, in *pb.HelloRequest) (*pb.HelloRe
 
 // gRPC server definitions.
 func (s *server) OnInvoke(ctx context.Context, in *commonv1pb.InvokeRequest) (*commonv1pb.InvokeResponse, error) {
-	log.Printf("Got invoked method %s and data: %s\n", in.Method, string(in.GetData().Value))
+	log.Printf("Got invoked method %s and data: %s", in.Method, string(in.GetData().Value))
 
 	resp := &commonv1pb.InvokeResponse{}
 
 	if in.Method == "GetCallCount" {
 		log.Println("Getting call counts")
 		for key, val := range s.callTracking {
-			log.Printf("\t%s - Called %d times.\n", key, len(val))
+			log.Printf("\t%s - Called %d times.", key, len(val))
 		}
 		b, err := json.Marshal(s.callTracking)
 
@@ -146,7 +149,7 @@ func (s *server) OnInvoke(ctx context.Context, in *commonv1pb.InvokeRequest) (*c
 func (s *server) ListTopicSubscriptions(ctx context.Context, in *emptypb.Empty) (*runtimev1pb.ListTopicSubscriptionsResponse, error) {
 	log.Println("List Topic Subscription called")
 	return &runtimev1pb.ListTopicSubscriptionsResponse{
-		Subscriptions: []*commonv1pb.TopicSubscription{
+		Subscriptions: []*runtimev1pb.TopicSubscription{
 			{
 				PubsubName: "dapr-resiliency-pubsub",
 				Topic:      "resiliency-topic-grpc",

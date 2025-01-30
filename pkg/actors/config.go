@@ -14,93 +14,90 @@ limitations under the License.
 package actors
 
 import (
+	"net/http"
 	"time"
 
+	"golang.org/x/exp/maps"
+
+	"github.com/dapr/dapr/pkg/actors/internal"
 	daprAppConfig "github.com/dapr/dapr/pkg/config"
+	"github.com/dapr/dapr/pkg/runtime/scheduler/clients"
 )
 
 // Config is the actor runtime configuration.
 type Config struct {
-	HostAddress                   string
-	AppID                         string
-	PlacementAddresses            []string
-	HostedActorTypes              []string
-	Port                          int
-	HeartbeatInterval             time.Duration
-	ActorDeactivationScanInterval time.Duration
-	ActorIdleTimeout              time.Duration
-	DrainOngoingCallTimeout       time.Duration
-	DrainRebalancedActors         bool
-	Namespace                     string
-	Reentrancy                    daprAppConfig.ReentrancyConfig
-	RemindersStoragePartitions    int
-	EntityConfigs                 map[string]EntityConfig
-}
-
-// Remap of app_config.EntityConfig but with more useful types for actors.go.
-type EntityConfig struct {
-	Entities                   []string
-	ActorIdleTimeout           time.Duration
-	DrainOngoingCallTimeout    time.Duration
-	DrainRebalancedActors      bool
-	ReentrancyConfig           daprAppConfig.ReentrancyConfig
-	RemindersStoragePartitions int
+	internal.Config
 }
 
 const (
 	defaultActorIdleTimeout     = time.Minute * 60
 	defaultHeartbeatInterval    = time.Second * 1
-	defaultActorScanInterval    = time.Second * 30
 	defaultOngoingCallTimeout   = time.Second * 60
 	defaultReentrancyStackLimit = 32
 )
 
+// ConfigOpts contains options for NewConfig.
+type ConfigOpts struct {
+	HostAddress       string
+	AppID             string
+	ActorsService     string
+	RemindersService  string
+	SchedulerClients  *clients.Clients
+	Port              int
+	Namespace         string
+	AppConfig         daprAppConfig.ApplicationConfig
+	HealthHTTPClient  *http.Client
+	HealthEndpoint    string
+	AppChannelAddress string
+	PodName           string
+}
+
 // NewConfig returns the actor runtime configuration.
-func NewConfig(hostAddress, appID string, placementAddresses []string, port int, namespace string, appConfig daprAppConfig.ApplicationConfig) Config {
-	c := Config{
-		HostAddress:                   hostAddress,
-		AppID:                         appID,
-		PlacementAddresses:            placementAddresses,
-		HostedActorTypes:              appConfig.Entities,
-		Port:                          port,
-		HeartbeatInterval:             defaultHeartbeatInterval,
-		ActorDeactivationScanInterval: defaultActorScanInterval,
-		ActorIdleTimeout:              defaultActorIdleTimeout,
-		DrainOngoingCallTimeout:       defaultOngoingCallTimeout,
-		DrainRebalancedActors:         appConfig.DrainRebalancedActors,
-		Namespace:                     namespace,
-		Reentrancy:                    appConfig.Reentrancy,
-		RemindersStoragePartitions:    appConfig.RemindersStoragePartitions,
-		EntityConfigs:                 make(map[string]EntityConfig),
+func NewConfig(opts ConfigOpts) Config {
+	c := internal.Config{
+		HostAddress:                opts.HostAddress,
+		AppID:                      opts.AppID,
+		ActorsService:              opts.ActorsService,
+		RemindersService:           opts.RemindersService,
+		SchedulerClients:           opts.SchedulerClients,
+		Port:                       opts.Port,
+		Namespace:                  opts.Namespace,
+		DrainRebalancedActors:      opts.AppConfig.DrainRebalancedActors,
+		HostedActorTypes:           internal.NewHostedActors(opts.AppConfig.Entities),
+		Reentrancy:                 opts.AppConfig.Reentrancy,
+		RemindersStoragePartitions: opts.AppConfig.RemindersStoragePartitions,
+		HealthHTTPClient:           opts.HealthHTTPClient,
+		HealthEndpoint:             opts.HealthEndpoint,
+		HeartbeatInterval:          defaultHeartbeatInterval,
+		ActorIdleTimeout:           defaultActorIdleTimeout,
+		DrainOngoingCallTimeout:    defaultOngoingCallTimeout,
+		EntityConfigs:              make(map[string]internal.EntityConfig),
+		AppChannelAddress:          opts.AppChannelAddress,
+		PodName:                    opts.PodName,
 	}
 
-	scanDuration, err := time.ParseDuration(appConfig.ActorScanInterval)
-	if err == nil {
-		c.ActorDeactivationScanInterval = scanDuration
-	}
-
-	idleDuration, err := time.ParseDuration(appConfig.ActorIdleTimeout)
+	idleDuration, err := time.ParseDuration(opts.AppConfig.ActorIdleTimeout)
 	if err == nil {
 		c.ActorIdleTimeout = idleDuration
 	}
 
-	drainCallDuration, err := time.ParseDuration(appConfig.DrainOngoingCallTimeout)
+	drainCallDuration, err := time.ParseDuration(opts.AppConfig.DrainOngoingCallTimeout)
 	if err == nil {
 		c.DrainOngoingCallTimeout = drainCallDuration
 	}
 
-	if appConfig.Reentrancy.MaxStackDepth == nil {
+	if opts.AppConfig.Reentrancy.MaxStackDepth == nil {
 		reentrancyLimit := defaultReentrancyStackLimit
 		c.Reentrancy.MaxStackDepth = &reentrancyLimit
 	}
 
 	// Make a map of the hosted actors so we can reference it below.
-	hostedTypes := make(map[string]bool, len(appConfig.Entities))
-	for _, hostedType := range appConfig.Entities {
+	hostedTypes := make(map[string]bool, len(opts.AppConfig.Entities))
+	for _, hostedType := range opts.AppConfig.Entities {
 		hostedTypes[hostedType] = true
 	}
 
-	for _, entityConfg := range appConfig.EntityConfigs {
+	for _, entityConfg := range opts.AppConfig.EntityConfigs {
 		config := translateEntityConfig(entityConfg)
 		for _, entity := range entityConfg.Entities {
 			if _, ok := hostedTypes[entity]; ok {
@@ -111,12 +108,17 @@ func NewConfig(hostAddress, appID string, placementAddresses []string, port int,
 		}
 	}
 
-	return c
+	conf := Config{Config: c}
+	return conf
 }
 
 func (c *Config) GetIdleTimeoutForType(actorType string) time.Duration {
 	if val, ok := c.EntityConfigs[actorType]; ok {
 		return val.ActorIdleTimeout
+	}
+	actorIdleTimeout := c.HostedActorTypes.GetActorIdleTimeout(actorType)
+	if actorIdleTimeout > 0 {
+		return actorIdleTimeout
 	}
 	return c.ActorIdleTimeout
 }
@@ -142,15 +144,8 @@ func (c *Config) GetReentrancyForType(actorType string) daprAppConfig.Reentrancy
 	return c.Reentrancy
 }
 
-func (c *Config) GetRemindersPartitionCountForType(actorType string) int {
-	if val, ok := c.EntityConfigs[actorType]; ok {
-		return val.RemindersStoragePartitions
-	}
-	return c.RemindersStoragePartitions
-}
-
-func translateEntityConfig(appConfig daprAppConfig.EntityConfig) EntityConfig {
-	domainConfig := EntityConfig{
+func translateEntityConfig(appConfig daprAppConfig.EntityConfig) internal.EntityConfig {
+	domainConfig := internal.EntityConfig{
 		Entities:                   appConfig.Entities,
 		ActorIdleTimeout:           defaultActorIdleTimeout,
 		DrainOngoingCallTimeout:    defaultOngoingCallTimeout,
@@ -175,4 +170,32 @@ func translateEntityConfig(appConfig daprAppConfig.EntityConfig) EntityConfig {
 	}
 
 	return domainConfig
+}
+
+type hostedActors map[string]struct{}
+
+// NewHostedActors creates a new hostedActors from a slice of actor types.
+func NewHostedActors(actorTypes []string) hostedActors {
+	// Add + 1 capacity because there's likely the built-in actor engine
+	ha := make(hostedActors, len(actorTypes)+1)
+	for _, at := range actorTypes {
+		ha[at] = struct{}{}
+	}
+	return ha
+}
+
+// AddActorType adds an actor type.
+func (ha hostedActors) AddActorType(actorType string) {
+	ha[actorType] = struct{}{}
+}
+
+// IsActorTypeHosted returns true if the actor type is hosted.
+func (ha hostedActors) IsActorTypeHosted(actorType string) bool {
+	_, ok := ha[actorType]
+	return ok
+}
+
+// ListActorTypes returns a slice of hosted actor types (in indeterminate order).
+func (ha hostedActors) ListActorTypes() []string {
+	return maps.Keys(ha)
 }

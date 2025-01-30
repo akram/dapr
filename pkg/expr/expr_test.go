@@ -24,7 +24,7 @@ func TestEval(t *testing.T) {
 		},
 	})
 	require.NoError(t, err)
-	assert.Equal(t, true, result)
+	assert.True(t, result.(bool))
 }
 
 func TestJSONMarshal(t *testing.T) {
@@ -35,6 +35,14 @@ func TestJSONMarshal(t *testing.T) {
 	assert.Equal(t, `(has(input.test) && input.test == 1234) || (has(result.test) && result.test == 5678)`, e.Expr())
 	_, err = e.MarshalJSON()
 	require.NoError(t, err)
+}
+
+func TestEmptyProgramNoPanic(t *testing.T) {
+	var e expr.Expr
+	r, err := e.Eval(map[string]interface{}{})
+
+	assert.Nil(t, r)
+	require.Error(t, err)
 }
 
 var result interface{}

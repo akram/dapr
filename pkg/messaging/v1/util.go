@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"sync"
 
 	"go.opentelemetry.io/otel/trace"
 	epb "google.golang.org/genproto/googleapis/rpc/errdetails"
@@ -35,15 +36,22 @@ import (
 )
 
 const (
+	// Maximum size, in bytes, for the buffer used by CallLocalStream: 2KB.
+	StreamBufferSize = 2 << 10
+
 	// GRPCContentType is the MIME media type for grpc.
 	GRPCContentType = "application/grpc"
 	// JSONContentType is the MIME media type for JSON.
 	JSONContentType = "application/json"
 	// ProtobufContentType is the MIME media type for Protobuf.
 	ProtobufContentType = "application/x-protobuf"
+	// OctetStreamContentType is the MIME media type for arbitrary binary data.
+	OctetStreamContentType = "application/octet-stream"
 
 	// ContentTypeHeader is the header key of content-type.
 	ContentTypeHeader = "content-type"
+	// ContentLengthHeader is the header key of content-length.
+	ContentLengthHeader = "content-length"
 	// DaprHeaderPrefix is the prefix if metadata is defined by non user-defined http headers.
 	DaprHeaderPrefix = "dapr-"
 	// gRPCBinaryMetadata is the suffix of grpc metadata binary value.
@@ -65,7 +73,20 @@ const (
 	errorInfoDomain            = "dapr.io"
 	errorInfoHTTPCodeMetadata  = "http.code"
 	errorInfoHTTPErrorMetadata = "http.error_message"
+
+	CallerIDHeader = DaprHeaderPrefix + "caller-app-id"
+	CalleeIDHeader = DaprHeaderPrefix + "callee-app-id"
 )
+
+// BufPool is a pool of *[]byte used by direct messaging (for sending on both the server and client). Their size is fixed at StreamBufferSize.
+var BufPool = sync.Pool{
+	New: func() any {
+		// Return a pointer here
+		// See https://github.com/dominikh/go-tools/issues/1336 for explanation
+		b := make([]byte, StreamBufferSize)
+		return &b
+	},
+}
 
 // DaprInternalMetadata is the metadata type to transfer HTTP header and gRPC metadata
 // from user app to Dapr.
@@ -74,25 +95,6 @@ type DaprInternalMetadata map[string]*internalv1pb.ListStringValue
 // IsJSONContentType returns true if contentType is the mime media type for JSON.
 func IsJSONContentType(contentType string) bool {
 	return strings.HasPrefix(strings.ToLower(contentType), JSONContentType)
-}
-
-// MetadataToInternalMetadata converts metadata to dapr internal metadata map.
-func MetadataToInternalMetadata(md map[string][]string) DaprInternalMetadata {
-	internalMD := DaprInternalMetadata{}
-	for k, values := range md {
-		listValue := internalv1pb.ListStringValue{}
-		if strings.HasSuffix(k, gRPCBinaryMetadataSuffix) {
-			// binary key requires base64 encoded.
-			for _, val := range values {
-				listValue.Values = append(listValue.Values, base64.StdEncoding.EncodeToString([]byte(val)))
-			}
-		} else {
-			listValue.Values = append(listValue.Values, values...)
-		}
-		internalMD[k] = &listValue
-	}
-
-	return internalMD
 }
 
 // isPermanentHTTPHeader checks whether hdr belongs to the list of
@@ -148,39 +150,39 @@ func InternalMetadataToGrpcMetadata(ctx context.Context, internalMD DaprInternal
 		// get both the trace headers for HTTP/GRPC and continue
 		switch keyName {
 		case traceparentHeader:
-			traceparentValue = listVal.Values[0]
+			traceparentValue = listVal.GetValues()[0]
 			continue
 		case tracestateHeader:
-			tracestateValue = listVal.Values[0]
+			tracestateValue = listVal.GetValues()[0]
 			continue
 		case tracebinMetadata:
-			grpctracebinValue = listVal.Values[0]
+			grpctracebinValue = listVal.GetValues()[0]
 			continue
 		case DestinationIDHeader:
 			continue
 		}
 
 		if httpHeaderConversion && isPermanentHTTPHeader(k) {
-			keyName = strings.ToLower(DaprHeaderPrefix + keyName)
+			keyName = DaprHeaderPrefix + keyName
 		}
 
 		if strings.HasSuffix(k, gRPCBinaryMetadataSuffix) {
 			// decoded base64 encoded key binary
-			for _, val := range listVal.Values {
+			for _, val := range listVal.GetValues() {
 				decoded, err := base64.StdEncoding.DecodeString(val)
 				if err == nil {
 					md.Append(keyName, string(decoded))
 				}
 			}
 		} else {
-			md.Append(keyName, listVal.Values...)
+			md.Append(keyName, listVal.GetValues()...)
 		}
 	}
 
 	if IsGRPCProtocol(internalMD) {
 		processGRPCToGRPCTraceHeader(ctx, md, grpctracebinValue)
 	} else {
-		// if httpProtocol, then pass HTTP traceparent and HTTP tracestate header values, attach it in grpc-trace-bin header
+		// if HTTP protocol, then pass HTTP traceparent and HTTP tracestate header values, attach it in grpc-trace-bin header
 		processHTTPToGRPCTraceHeader(ctx, md, traceparentValue, tracestateValue)
 	}
 	return md
@@ -190,12 +192,12 @@ func InternalMetadataToGrpcMetadata(ctx context.Context, internalMD DaprInternal
 func IsGRPCProtocol(internalMD DaprInternalMetadata) bool {
 	originContentType := ""
 	if val, ok := internalMD[ContentTypeHeader]; ok {
-		originContentType = val.Values[0]
+		originContentType = val.GetValues()[0]
 	}
 	return strings.HasPrefix(originContentType, GRPCContentType)
 }
 
-func reservedGRPCMetadataToDaprPrefixHeader(key string) string {
+func ReservedGRPCMetadataToDaprPrefixHeader(key string) string {
 	// https://github.com/grpc/grpc/blob/master/doc/PROTOCOL-HTTP2.md
 	if key == ":method" || key == ":scheme" || key == ":path" || key == ":authority" {
 		return DaprHeaderPrefix + key[1:]
@@ -211,26 +213,33 @@ func reservedGRPCMetadataToDaprPrefixHeader(key string) string {
 func InternalMetadataToHTTPHeader(ctx context.Context, internalMD DaprInternalMetadata, setHeader func(string, string)) {
 	var traceparentValue, tracestateValue, grpctracebinValue string
 	for k, listVal := range internalMD {
+		if len(listVal.GetValues()) == 0 {
+			continue
+		}
+
 		keyName := strings.ToLower(k)
 		// get both the trace headers for HTTP/GRPC and continue
 		switch keyName {
 		case traceparentHeader:
-			traceparentValue = listVal.Values[0]
+			traceparentValue = listVal.GetValues()[0]
 			continue
 		case tracestateHeader:
-			tracestateValue = listVal.Values[0]
+			tracestateValue = listVal.GetValues()[0]
 			continue
 		case tracebinMetadata:
-			grpctracebinValue = listVal.Values[0]
+			grpctracebinValue = listVal.GetValues()[0]
 			continue
 		case DestinationIDHeader:
 			continue
 		}
 
-		if len(listVal.Values) == 0 || strings.HasSuffix(keyName, gRPCBinaryMetadataSuffix) || keyName == ContentTypeHeader {
+		if strings.HasSuffix(keyName, gRPCBinaryMetadataSuffix) || keyName == ContentTypeHeader {
 			continue
 		}
-		setHeader(reservedGRPCMetadataToDaprPrefixHeader(keyName), listVal.Values[0])
+
+		for _, v := range listVal.GetValues() {
+			setHeader(ReservedGRPCMetadataToDaprPrefixHeader(keyName), v)
+		}
 	}
 	if IsGRPCProtocol(internalMD) {
 		// if grpcProtocol, then get grpc-trace-bin value, and attach it in HTTP traceparent and HTTP tracestate header
@@ -288,6 +297,10 @@ func HTTPStatusFromCode(code codes.Code) int {
 // CodeFromHTTPStatus converts http status code to gRPC status code
 // See: https://github.com/grpc/grpc/blob/master/doc/http-grpc-status-mapping.md
 func CodeFromHTTPStatus(httpStatusCode int) codes.Code {
+	if httpStatusCode >= 200 && httpStatusCode < 300 {
+		return codes.OK
+	}
+
 	switch httpStatusCode {
 	case http.StatusRequestTimeout:
 		return codes.Canceled
@@ -311,10 +324,6 @@ func CodeFromHTTPStatus(httpStatusCode int) codes.Code {
 		return codes.Unimplemented
 	case http.StatusServiceUnavailable:
 		return codes.Unavailable
-	}
-
-	if httpStatusCode >= 200 && httpStatusCode < 300 {
-		return codes.OK
 	}
 
 	return codes.Unknown
@@ -432,15 +441,6 @@ func processGRPCToGRPCTraceHeader(ctx context.Context, md metadata.MD, grpctrace
 	}
 }
 
-func cloneBytes(data []byte) []byte {
-	if data == nil {
-		return nil
-	}
-	cloneData := make([]byte, len(data))
-	copy(cloneData, data)
-	return cloneData
-}
-
 // ProtobufToJSON serializes Protobuf message to json format.
 func ProtobufToJSON(message protoreflect.ProtoMessage) ([]byte, error) {
 	marshaler := protojson.MarshalOptions{
@@ -454,6 +454,13 @@ func ProtobufToJSON(message protoreflect.ProtoMessage) ([]byte, error) {
 // WithCustomGRPCMetadata applies a metadata map to the outgoing context metadata.
 func WithCustomGRPCMetadata(ctx context.Context, md map[string]string) context.Context {
 	for k, v := range md {
+		if strings.EqualFold(k, ContentTypeHeader) ||
+			strings.EqualFold(k, ContentLengthHeader) {
+			// There is no use of the original payload's content-length because
+			// the entire data is already in the cloud event.
+			continue
+		}
+
 		// Uppercase keys will be converted to lowercase.
 		ctx = metadata.AppendToOutgoingContext(ctx, k, v)
 	}

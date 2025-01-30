@@ -1,3 +1,5 @@
+//go:build allcomponents || stablecomponents
+
 /*
 Copyright 2021 The Dapr Authors
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,9 +17,20 @@ package components
 
 import (
 	"github.com/dapr/components-contrib/state/cockroachdb"
+	pgv2 "github.com/dapr/components-contrib/state/postgresql/v2"
+	"github.com/dapr/dapr/pkg/components"
 	stateLoader "github.com/dapr/dapr/pkg/components/state"
 )
 
 func init() {
-	stateLoader.DefaultRegistry.RegisterComponent(cockroachdb.New, "cockroachdb")
+	stateLoader.DefaultRegistry.RegisterComponentWithVersions("cockroachdb", components.Versioning{
+		Preferred: components.VersionConstructor{
+			// For v2, this component uses the same implementation as the postgres state store
+			Version: "v2", Constructor: pgv2.NewPostgreSQLStateStore,
+		},
+		Others: []components.VersionConstructor{
+			{Version: "v1", Constructor: cockroachdb.New},
+		},
+		Default: "v1",
+	})
 }

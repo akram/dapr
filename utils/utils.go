@@ -14,68 +14,31 @@ limitations under the License.
 package utils
 
 import (
+	"fmt"
+	"io/fs"
 	"os"
-	"path/filepath"
 	"strings"
-	"time"
-
-	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/rest"
-	"k8s.io/client-go/tools/clientcmd"
 )
 
-var (
-	clientSet     *kubernetes.Clientset
-	kubeConfig    *rest.Config
-	KubeConfigVar = "KUBE_CONFIG"
+const (
+	DotDelimiter = "."
 )
-
-func initKubeConfig() {
-	kubeConfig = GetConfig()
-	clientset, err := kubernetes.NewForConfig(kubeConfig)
-	if err != nil {
-		panic(err)
-	}
-
-	clientSet = clientset
-}
-
-// GetConfig gets a kubernetes rest config.
-func GetConfig() *rest.Config {
-	if kubeConfig != nil {
-		return kubeConfig
-	}
-	conf, err := rest.InClusterConfig()
-	if err != nil {
-		conf, err = clientcmd.BuildConfigFromFlags("", os.Getenv(KubeConfigVar))
-		if err != nil {
-			panic(err)
-		}
-	}
-
-	return conf
-}
-
-// GetKubeClient gets a kubernetes client.
-func GetKubeClient() *kubernetes.Clientset {
-	if clientSet == nil {
-		initKubeConfig()
-	}
-
-	return clientSet
-}
-
-// ToISO8601DateTimeString converts dateTime to ISO8601 Format
-// ISO8601 Format: 2020-01-01T01:01:01.10101Z.
-func ToISO8601DateTimeString(dateTime time.Time) string {
-	return dateTime.UTC().Format("2006-01-02T15:04:05.999999Z")
-}
 
 // Contains reports whether v is present in s.
 // Similar to https://pkg.go.dev/golang.org/x/exp/slices#Contains.
 func Contains[T comparable](s []T, v T) bool {
 	for _, e := range s {
 		if e == v {
+			return true
+		}
+	}
+	return false
+}
+
+// ContainsPrefixed reports whether v is prefixed by any of the strings in s.
+func ContainsPrefixed(prefixes []string, v string) bool {
+	for _, e := range prefixes {
+		if strings.HasPrefix(v, e) {
 			return true
 		}
 	}
@@ -101,22 +64,93 @@ func GetEnvOrElse(name, orElse string) string {
 	return orElse
 }
 
-// IsTruthy returns true if a string is a truthy value.
-// Truthy values are "y", "yes", "true", "t", "on", "1" (case-insensitive); everything else is false.
-func IsTruthy(val string) bool {
-	switch strings.ToLower(strings.TrimSpace(val)) {
-	case "y", "yes", "true", "t", "on", "1":
-		return true
-	default:
-		return false
+// GetIntValOrDefault returns an int value if greater than 0 OR default value.
+func GetIntValOrDefault(val int, defaultValue int) int {
+	if val > 0 {
+		return val
 	}
+	return defaultValue
 }
 
-// IsYaml checks whether the file is yaml or not.
-func IsYaml(fileName string) bool {
-	extension := strings.ToLower(filepath.Ext(fileName))
-	if extension == ".yaml" || extension == ".yml" {
-		return true
+// IsSocket returns if the given file is a unix socket.
+func IsSocket(f fs.FileInfo) bool {
+	return f.Mode()&fs.ModeSocket != 0
+}
+
+// SocketExists returns true if the file in that path is an unix socket.
+func SocketExists(socketPath string) bool {
+	if s, err := os.Stat(socketPath); err == nil {
+		return IsSocket(s)
 	}
 	return false
+}
+
+func PopulateMetadataForBulkPublishEntry(reqMeta, entryMeta map[string]string) map[string]string {
+	resMeta := map[string]string{}
+	for k, v := range entryMeta {
+		resMeta[k] = v
+	}
+	for k, v := range reqMeta {
+		if _, ok := resMeta[k]; !ok {
+			// Populate only metadata key that is already not present in the entry level metadata map
+			resMeta[k] = v
+		}
+	}
+
+	return resMeta
+}
+
+// Filter returns a new slice containing all items in the given slice that satisfy the given test.
+func Filter[T any](items []T, test func(item T) bool) []T {
+	filteredItems := make([]T, len(items))
+	n := 0
+	for i := range items {
+		if test(items[i]) {
+			filteredItems[n] = items[i]
+			n++
+		}
+	}
+	return filteredItems[:n]
+}
+
+// MapToSlice is the inversion of SliceToMap. Order is not guaranteed as map retrieval order is not.
+func MapToSlice[T comparable, V any](m map[T]V) []T {
+	l := make([]T, len(m))
+	var i int
+	for uid := range m {
+		l[i] = uid
+		i++
+	}
+	return l
+}
+
+const (
+	logNameFmt        = "%s (%s)"
+	logNameVersionFmt = "%s (%s/%s)"
+)
+
+// ComponentLogName returns the name of a component that can be used in logging.
+func ComponentLogName(name, typ, version string) string {
+	if version == "" {
+		return fmt.Sprintf(logNameFmt, name, typ)
+	}
+
+	return fmt.Sprintf(logNameVersionFmt, name, typ, version)
+}
+
+// GetNamespaceOrDefault returns the namespace for Dapr, or the default namespace if it is not set.
+func GetNamespaceOrDefault(defaultNamespace string) string {
+	namespace := os.Getenv("NAMESPACE")
+	if namespace == "" {
+		namespace = defaultNamespace
+	}
+	return namespace
+}
+
+func ParseServiceAddr(val string) []string {
+	p := strings.Split(val, ",")
+	for i, v := range p {
+		p[i] = strings.TrimSpace(v)
+	}
+	return p
 }

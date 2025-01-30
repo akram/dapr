@@ -36,7 +36,14 @@ spec:
       retryForever:
         policy: exponential
         maxInterval: 15s
-        maxRetries: 0 # Retry indefinitely
+        maxRetries: -1 # Retry indefinitely
+
+      noRetry:
+        policy: constant
+        maxRetries: 0 # No retries
+
+      missingMaxRetries:
+        policy: constant
 
       important:
         policy: constant
@@ -51,6 +58,14 @@ spec:
         policy: constant
         duration: 5s
         maxRetries: 3
+
+      withMatch:
+        policy: constant
+        duration: 5s
+        maxRetries: 3
+        matching:
+          httpStatusCodes: "500"
+
 
     # Circuit breakers are automatically instantiated per component, service endpoint, and application route.
     # using these settings as a template. See logic below under `buildingBlocks`.
@@ -92,6 +107,12 @@ spec:
         # Circuit breakers for services are scoped per endpoint (e.g. hostname + port).
         # When a breaker is tripped, that route is removed from load balancing for the configured `timeout` duration.
         circuitBreaker: serviceCB
+      appC:
+        timeout: general
+        retry: withMatch
+        # Circuit breakers for services are scoped per endpoint (e.g. hostname + port).
+        # When a breaker is tripped, that route is removed from load balancing for the configured `timeout` duration.
+        circuitBreaker: serviceCB
 
     actors:
       myActorType:
@@ -127,3 +148,9 @@ spec:
           timeout: general
           retry: pubsubRetry
           circuitBreaker: pubsubCB
+
+      pubsub3:
+        inbound:
+          retry: noRetry
+        outbound:
+          retry: retryForever

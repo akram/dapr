@@ -17,6 +17,7 @@ import (
 	"encoding/json"
 	"log"
 	"net/http"
+	"os"
 	"sync"
 
 	"github.com/gorilla/mux"
@@ -24,7 +25,26 @@ import (
 	"github.com/dapr/dapr/tests/apps/utils"
 )
 
-const appPort = 3000
+const (
+	appPort                       = 3000
+	DaprTestTopicEnvVar           = "DAPR_TEST_TOPIC_NAME"
+	DaprTestCustomPathRouteEnvVar = "DAPR_TEST_CUSTOM_PATH_ROUTE"
+)
+
+var (
+	topicName       = "test-topic"
+	topicCustomPath = "custom-path"
+)
+
+func init() {
+	if envTopicName := os.Getenv(DaprTestTopicEnvVar); len(envTopicName) != 0 {
+		topicName = envTopicName
+	}
+
+	if envCustomPath := os.Getenv(DaprTestCustomPathRouteEnvVar); len(envCustomPath) != 0 {
+		topicCustomPath = envCustomPath
+	}
+}
 
 type messageBuffer struct {
 	lock            *sync.RWMutex
@@ -171,15 +191,15 @@ func testHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 // appRouter initializes restful api router
-func appRouter() *mux.Router {
+func appRouter() http.Handler {
 	router := mux.NewRouter().StrictSlash(true)
 
 	// Log requests and their processing time
 	router.Use(utils.LoggerMiddleware)
 
 	router.HandleFunc("/", indexHandler).Methods("GET")
-	router.HandleFunc("/test-topic", testTopicHandler).Methods("POST", "OPTIONS")
-	router.HandleFunc("/custom-path", testRoutedTopicHandler).Methods("POST", "OPTIONS")
+	router.HandleFunc("/"+topicName, testTopicHandler).Methods("POST", "OPTIONS")
+	router.HandleFunc("/"+topicCustomPath, testRoutedTopicHandler).Methods("POST", "OPTIONS")
 	router.HandleFunc("/tests/get_received_topics", testHandler).Methods("POST")
 
 	router.Use(mux.CORSMethodMiddleware(router))

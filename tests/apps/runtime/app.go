@@ -100,6 +100,7 @@ func invokeDaprGRPCAPI() error {
 	// Dial the gRPC endpoint and fail if cannot connect in 10 seconds.
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
+	//nolint:staticcheck
 	conn, err := grpc.DialContext(ctx,
 		daprGRPCAddr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
@@ -210,7 +211,7 @@ func getBindingsDaprAPIResponse(w http.ResponseWriter, r *http.Request) {
 }
 
 // appRouter initializes restful api router.
-func appRouter() *mux.Router {
+func appRouter() http.Handler {
 	log.Printf("Enter appRouter()")
 	router := mux.NewRouter().StrictSlash(true)
 

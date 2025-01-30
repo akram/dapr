@@ -15,34 +15,44 @@ package apphealth
 
 import (
 	"context"
+	"errors"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"time"
 
-	"go.uber.org/atomic"
+	"k8s.io/utils/clock"
 
+	"github.com/dapr/dapr/pkg/config"
 	"github.com/dapr/kit/logger"
 )
 
 const (
 	AppStatusUnhealthy uint8 = 0
 	AppStatusHealthy   uint8 = 1
+
+	// reportMinInterval is the minimum interval between health reports.
+	reportMinInterval = time.Second
 )
 
 var log = logger.NewLogger("dapr.apphealth")
 
 // AppHealth manages the health checks for the app.
 type AppHealth struct {
-	config       *Config
+	config       config.AppHealthConfig
 	probeFn      ProbeFunction
 	changeCb     ChangeCallback
 	report       chan uint8
-	failureCount *atomic.Int32
-	lastReport   *atomic.Int64
+	failureCount atomic.Int32
 	queue        chan struct{}
 
-	// Minimum interval between reports, in microseconds.
-	// Used by ratelimitReports (as a variable so it can be changed in tests).
-	reportMinInterval int64
+	// lastReport is the last report as UNIX microseconds time.
+	lastReport atomic.Int64
+
+	clock   clock.WithTicker
+	wg      sync.WaitGroup
+	closed  atomic.Bool
+	closeCh chan struct{}
 }
 
 // ProbeFunction is the signature of the function that performs health probes.
@@ -51,19 +61,23 @@ type AppHealth struct {
 type ProbeFunction func(context.Context) (bool, error)
 
 // ChangeCallback is the signature of the callback that is invoked when the app's health status changes.
-type ChangeCallback func(status uint8)
+type ChangeCallback func(ctx context.Context, status uint8)
 
-// NewAppHealth creates a new AppHealth object.
-func NewAppHealth(config *Config, probeFn ProbeFunction) *AppHealth {
-	return &AppHealth{
-		config:            config,
-		probeFn:           probeFn,
-		report:            make(chan uint8, 1),
-		failureCount:      atomic.NewInt32(config.Threshold), // Initial state is unhealthy until we validate it
-		lastReport:        atomic.NewInt64(0),
-		reportMinInterval: 1e6,
-		queue:             make(chan struct{}, 1),
+// New creates a new AppHealth object.
+func New(config config.AppHealthConfig, probeFn ProbeFunction) *AppHealth {
+	a := &AppHealth{
+		config:  config,
+		probeFn: probeFn,
+		report:  make(chan uint8, 1),
+		queue:   make(chan struct{}, 1),
+		clock:   &clock.RealClock{},
+		closeCh: make(chan struct{}),
 	}
+
+	// Initial state is unhealthy until we validate it
+	a.failureCount.Store(config.Threshold)
+
+	return a
 }
 
 // OnHealthChange sets the callback that is invoked when the health of the app changes (app becomes either healthy or unhealthy).
@@ -72,18 +86,41 @@ func (h *AppHealth) OnHealthChange(cb ChangeCallback) {
 }
 
 // StartProbes starts polling the app on the interval.
-func (h *AppHealth) StartProbes(ctx context.Context) {
+func (h *AppHealth) StartProbes(ctx context.Context) error {
+	if h.closed.Load() {
+		return errors.New("app health is closed")
+	}
+
 	if h.probeFn == nil {
-		log.Fatal("Cannot start probes with nil probe function")
+		return errors.New("cannot start probes with nil probe function")
+	}
+	if h.config.ProbeInterval <= 0 {
+		return errors.New("probe interval must be larger than 0")
 	}
 	if h.config.ProbeTimeout > h.config.ProbeInterval {
-		log.Fatal("App health checks probe timeouts must be smaller than probe intervals")
+		return errors.New("app health checks probe timeouts must be smaller than probe intervals")
 	}
 
 	log.Info("App health probes starting")
 
+	ctx, cancel := context.WithCancel(ctx)
+
+	h.wg.Add(2)
 	go func() {
-		ticker := time.NewTicker(h.config.ProbeInterval)
+		defer h.wg.Done()
+		defer cancel()
+		select {
+		case <-h.closeCh:
+		case <-ctx.Done():
+		}
+	}()
+
+	go func() {
+		defer h.wg.Done()
+
+		ticker := h.clock.NewTicker(h.config.ProbeInterval)
+		ch := ticker.C()
+		defer ticker.Stop()
 
 		for {
 			select {
@@ -91,19 +128,20 @@ func (h *AppHealth) StartProbes(ctx context.Context) {
 				ticker.Stop()
 				log.Info("App health probes stopping")
 				return
-			case <-ticker.C:
-				log.Debug("Probing app health")
-				h.Enqueue()
 			case status := <-h.report:
 				log.Debug("Received health status report")
-				ticker.Reset(h.config.ProbeInterval)
-				h.setResult(status == AppStatusHealthy)
+				h.setResult(ctx, status == AppStatusHealthy)
+			case <-ch:
+				log.Debug("Probing app health")
+				h.Enqueue()
 			case <-h.queue:
 				// Run synchronously so the loop is blocked
 				h.doProbe(ctx)
 			}
 		}
 	}()
+
+	return nil
 }
 
 // Enqueue adds a new probe request to the queue
@@ -115,6 +153,7 @@ func (h *AppHealth) Enqueue() {
 	default:
 		// Do nothing
 	}
+	return
 }
 
 // ReportHealth is used by the runtime to report a health signal from the app.
@@ -153,17 +192,17 @@ func (h *AppHealth) GetStatus() uint8 {
 // Should be invoked in a background goroutine.
 func (h *AppHealth) doProbe(parentCtx context.Context) {
 	ctx, cancel := context.WithTimeout(parentCtx, h.config.ProbeTimeout)
-	successful, err := h.probeFn(ctx)
-	cancel()
+	defer cancel()
 
-	// In case of errors, we do not record the failed probe because this is generally an internal error
+	successful, err := h.probeFn(ctx)
 	if err != nil {
+		h.setResult(parentCtx, false)
 		log.Errorf("App health probe could not complete with error: %v", err)
 		return
 	}
 
 	log.Debug("App health probe successful: " + strconv.FormatBool(successful))
-	h.setResult(successful)
+	h.setResult(parentCtx, successful)
 }
 
 // Returns true if the health report can be saved. Only 1 report per second at most is allowed.
@@ -173,7 +212,7 @@ func (h *AppHealth) ratelimitReports() bool {
 		attempts uint8
 	)
 
-	now := time.Now().UnixMicro()
+	now := h.clock.Now().UnixMicro()
 
 	// Attempts at most 2 times before giving up, as the report may be stale at that point
 	for !swapped && attempts < 2 {
@@ -181,19 +220,19 @@ func (h *AppHealth) ratelimitReports() bool {
 
 		// If the last report was less than `reportMinInterval` ago, nothing to do here
 		prev := h.lastReport.Load()
-		if prev > now-h.reportMinInterval {
+		if prev > now-reportMinInterval.Microseconds() {
 			return false
 		}
 
-		swapped = h.lastReport.CAS(prev, now)
+		swapped = h.lastReport.CompareAndSwap(prev, now)
 	}
 
 	// If we couldn't do the swap after 2 attempts, just return false
 	return swapped
 }
 
-func (h *AppHealth) setResult(successful bool) {
-	h.lastReport.Store(time.Now().UnixMicro())
+func (h *AppHealth) setResult(ctx context.Context, successful bool) {
+	h.lastReport.Store(h.clock.Now().UnixMicro())
 
 	if successful {
 		// Reset the failure count
@@ -202,14 +241,18 @@ func (h *AppHealth) setResult(successful bool) {
 		if prev >= h.config.Threshold {
 			log.Info("App entered healthy status")
 			if h.changeCb != nil {
-				go h.changeCb(AppStatusHealthy)
+				h.wg.Add(1)
+				go func() {
+					defer h.wg.Done()
+					h.changeCb(ctx, AppStatusHealthy)
+				}()
 			}
 		}
 		return
 	}
 
 	// Count the failure
-	failures := h.failureCount.Inc()
+	failures := h.failureCount.Add(1)
 
 	// First, check if we've overflown
 	if failures < 0 {
@@ -217,9 +260,22 @@ func (h *AppHealth) setResult(successful bool) {
 		h.failureCount.Store(h.config.Threshold + 1)
 	} else if failures == h.config.Threshold {
 		// If we're here, we just passed the threshold right now
-		log.Warnf("App entered un-healthy status")
+		log.Warn("App entered un-healthy status")
 		if h.changeCb != nil {
-			go h.changeCb(AppStatusUnhealthy)
+			h.wg.Add(1)
+			go func() {
+				defer h.wg.Done()
+				h.changeCb(ctx, AppStatusUnhealthy)
+			}()
 		}
 	}
+}
+
+func (h *AppHealth) Close() error {
+	defer h.wg.Wait()
+	if h.closed.CompareAndSwap(false, true) {
+		close(h.closeCh)
+	}
+
+	return nil
 }

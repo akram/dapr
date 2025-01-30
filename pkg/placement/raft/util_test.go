@@ -15,40 +15,39 @@ package raft
 
 import (
 	"fmt"
-	"log"
 	"os"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestEnsureDir(t *testing.T) {
 	testDir := "_testDir"
 	t.Run("create dir successfully", func(t *testing.T) {
 		err := ensureDir(testDir)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		err = os.Remove(testDir)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("ensure the existing directory", func(t *testing.T) {
 		err := os.Mkdir(testDir, 0o700)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		err = ensureDir(testDir)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		err = os.Remove(testDir)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("fails to create dir", func(t *testing.T) {
 		file, err := os.Create(testDir)
-		assert.NoError(t, err)
-		log.Printf("%v", file)
+		require.NoError(t, err)
 		file.Close()
 		err = ensureDir(testDir)
-		assert.Error(t, err)
+		require.Error(t, err)
 		err = os.Remove(testDir)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 }
 
@@ -97,11 +96,11 @@ func TestMarshalAndUnmarshalMsgpack(t *testing.T) {
 	}
 
 	encoded, err := marshalMsgPack(testObject)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	var decoded testStruct
 	err = unmarshalMsgPack(encoded, &decoded)
-	assert.NoError(t, err)
+	require.NoError(t, err)
 
 	assert.Equal(t, testObject.Name, decoded.Name)
 	assert.Equal(t, testObject.StringArrayList, decoded.StringArrayList)
@@ -111,9 +110,10 @@ func TestMarshalAndUnmarshalMsgpack(t *testing.T) {
 func TestMakeRaftLogCommand(t *testing.T) {
 	// arrange
 	testMember := DaprHostMember{
-		Name:     "127.0.0.1:3030",
-		AppID:    "fakeAppID",
-		Entities: []string{"actorTypeOne", "actorTypeTwo"},
+		Name:      "127.0.0.1:3030",
+		Namespace: "ns1",
+		AppID:     "fakeAppID",
+		Entities:  []string{"actorTypeOne", "actorTypeTwo"},
 	}
 
 	// act

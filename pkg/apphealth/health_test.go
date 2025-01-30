@@ -14,44 +14,48 @@ limitations under the License.
 package apphealth
 
 import (
+	"context"
 	"math"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"go.uber.org/atomic"
+	clocktesting "k8s.io/utils/clock/testing"
+
+	"github.com/dapr/dapr/pkg/config"
 )
 
 func TestAppHealth_setResult(t *testing.T) {
 	var threshold int32 = 3
-	h := NewAppHealth(&Config{
+	h := New(config.AppHealthConfig{
 		Threshold: threshold,
 	}, nil)
 
 	// Set the initial state to healthy
-	h.setResult(true)
+	h.setResult(context.Background(), true)
 
 	statusChange := make(chan uint8, 1)
-	unexpectedStatusChanges := atomic.NewUint32(0)
-	h.OnHealthChange(func(status uint8) {
+	unexpectedStatusChanges := atomic.Int32{}
+	h.OnHealthChange(func(ctx context.Context, status uint8) {
 		select {
 		case statusChange <- status:
 			// Do nothing
 		default:
 			// If the channel is full, it means we were not expecting a status change
-			unexpectedStatusChanges.Inc()
+			unexpectedStatusChanges.Add(1)
 		}
 	})
 
 	simulateFailures := func(n int32) {
 		statusChange <- 255 // Fill the channel
-		for i := int32(0); i < n; i++ {
+		for i := range n {
 			if i == threshold-1 {
 				<-statusChange // Allow the channel to be written into
 			}
-			h.setResult(false)
+			h.setResult(context.Background(), false)
 			if i == threshold-1 {
 				select {
 				case v := <-statusChange:
@@ -73,7 +77,7 @@ func TestAppHealth_setResult(t *testing.T) {
 
 	// First success should bring the app back to healthy
 	<-statusChange // Allow the channel to be written into
-	h.setResult(true)
+	h.setResult(context.Background(), true)
 	select {
 	case v := <-statusChange:
 		assert.Equal(t, AppStatusHealthy, v)
@@ -85,11 +89,11 @@ func TestAppHealth_setResult(t *testing.T) {
 	// Multiple invocations in parallel
 	// Only one failure should be sent
 	wg := sync.WaitGroup{}
-	for i := 0; i < 5; i++ {
+	for range 5 {
 		wg.Add(1)
 		go func() {
-			for i := int32(0); i < (threshold + 5); i++ {
-				h.setResult(false)
+			for range threshold + 5 {
+				h.setResult(context.Background(), false)
 			}
 			wg.Done()
 		}()
@@ -109,21 +113,17 @@ func TestAppHealth_setResult(t *testing.T) {
 	// Test overflows
 	h.failureCount.Store(int32(math.MaxInt32 - 2))
 	statusChange <- 255 // Fill the channel again
-	for i := int32(0); i < 5; i++ {
-		h.setResult(false)
+	for range 5 {
+		h.setResult(context.Background(), false)
 	}
 	assert.Empty(t, unexpectedStatusChanges.Load())
 	assert.Equal(t, threshold+3, h.failureCount.Load())
 }
 
 func TestAppHealth_ratelimitReports(t *testing.T) {
-	// Set to 0.1 seconds
-	var minInterval int64 = 1e5
-
-	h := &AppHealth{
-		lastReport:        atomic.NewInt64(0),
-		reportMinInterval: minInterval,
-	}
+	clock := clocktesting.NewFakeClock(time.Now())
+	h := New(config.AppHealthConfig{}, nil)
+	h.clock = clock
 
 	// First run should always succeed
 	require.True(t, h.ratelimitReports())
@@ -132,51 +132,183 @@ func TestAppHealth_ratelimitReports(t *testing.T) {
 	require.False(t, h.ratelimitReports())
 	require.False(t, h.ratelimitReports())
 
-	// Wait and test
-	time.Sleep(time.Duration(minInterval+10) * time.Microsecond)
+	// Step and test
+	clock.Step(reportMinInterval)
 	require.True(t, h.ratelimitReports())
 	require.False(t, h.ratelimitReports())
 
 	// Run tests for 1 second, constantly
-	// Should succeed only 10 times (+/- 1)
-	time.Sleep(time.Duration(minInterval+10) * time.Microsecond)
-	firehose := func() (passed int64) {
-		var done bool
-		deadline := time.After(time.Second)
-		for !done {
-			select {
-			case <-deadline:
-				done = true
-			default:
-				if h.ratelimitReports() {
-					passed++
-				}
-				time.Sleep(10 * time.Nanosecond)
+	// Should succeed only 10 times.
+	clock.Step(reportMinInterval)
+	firehose := func(start time.Time, step time.Duration) (passed int64) {
+		for clock.Now().Sub(start) < time.Second*10 {
+			if h.ratelimitReports() {
+				passed++
 			}
+			clock.Step(step)
 		}
-
 		return passed
 	}
 
-	passed := firehose()
-
-	assert.GreaterOrEqual(t, passed, int64(9))
-	assert.LessOrEqual(t, passed, int64(11))
+	passed := firehose(clock.Now(), 10*time.Millisecond)
+	assert.Equal(t, int64(10), passed)
 
 	// Repeat, but run with 3 parallel goroutines
-	time.Sleep(time.Duration(minInterval+10) * time.Microsecond)
 	wg := sync.WaitGroup{}
-	totalPassed := atomic.NewInt64(0)
-	for i := 0; i < 3; i++ {
-		wg.Add(1)
+	totalPassed := atomic.Int64{}
+	start := clock.Now()
+	wg.Add(3)
+	for range 3 {
 		go func() {
-			totalPassed.Add(firehose())
+			totalPassed.Add(firehose(start, 3*time.Millisecond))
 			wg.Done()
 		}()
 	}
 	wg.Wait()
-
 	passed = totalPassed.Load()
-	assert.GreaterOrEqual(t, passed, int64(9))
-	assert.LessOrEqual(t, passed, int64(11))
+	assert.GreaterOrEqual(t, passed, int64(8))
+	assert.LessOrEqual(t, passed, int64(12))
+}
+
+func Test_StartProbes(t *testing.T) {
+	t.Run("closing context should return", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		done := make(chan struct{})
+
+		h := New(config.AppHealthConfig{
+			ProbeInterval: time.Second,
+		}, func(context.Context) (bool, error) {
+			assert.Fail(t, "unexpected probe call")
+			return false, nil
+		})
+		clock := clocktesting.NewFakeClock(time.Now())
+		h.clock = clock
+
+		go func() {
+			defer close(done)
+			assert.NoError(t, h.StartProbes(ctx))
+		}()
+
+		// Wait for ticker to start,
+		assert.Eventually(t, clock.HasWaiters, time.Second, time.Microsecond)
+		cancel()
+
+		select {
+		case <-done:
+		case <-time.After(time.Millisecond * 100):
+			assert.Fail(t, "StartProbes didn't return in time")
+		}
+	})
+
+	t.Run("calling StartProbes after it has already closed should error", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		h := New(config.AppHealthConfig{
+			ProbeInterval: time.Second,
+		}, func(context.Context) (bool, error) {
+			assert.Fail(t, "unexpected probe call")
+			return false, nil
+		})
+
+		h.Close()
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			assert.Error(t, h.StartProbes(ctx))
+		}()
+
+		select {
+		case <-done:
+		case <-time.After(time.Millisecond * 100):
+			require.Fail(t, "StartProbes didn't return in time")
+		}
+	})
+
+	t.Run("should return after closed", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		h := New(config.AppHealthConfig{
+			ProbeInterval: time.Second,
+		}, func(context.Context) (bool, error) {
+			assert.Fail(t, "unexpected probe call")
+			return false, nil
+		})
+		clock := clocktesting.NewFakeClock(time.Now())
+		h.clock = clock
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			assert.NoError(t, h.StartProbes(ctx))
+		}()
+
+		// Wait for ticker to start,
+		assert.Eventually(t, clock.HasWaiters, time.Second, time.Microsecond)
+
+		h.Close()
+
+		select {
+		case <-done:
+		case <-time.After(time.Millisecond * 100):
+			require.Fail(t, "StartProbes didn't return in time")
+		}
+	})
+
+	t.Run("should call app probe function after interval", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		t.Cleanup(cancel)
+
+		var probeCalls atomic.Int64
+		var currentStatus atomic.Uint32
+
+		h := New(config.AppHealthConfig{
+			ProbeInterval: time.Second,
+			Threshold:     1,
+		}, func(context.Context) (bool, error) {
+			defer probeCalls.Add(1)
+			return probeCalls.Load() == 0, nil
+		})
+		clock := clocktesting.NewFakeClock(time.Now())
+		h.clock = clock
+
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			assert.NoError(t, h.StartProbes(ctx))
+		}()
+
+		h.OnHealthChange(func(ctx context.Context, status uint8) {
+			currentStatus.Store(uint32(status))
+		})
+
+		// Wait for ticker to start,
+		assert.Eventually(t, clock.HasWaiters, time.Second, time.Microsecond)
+		assert.Equal(t, int64(0), probeCalls.Load())
+
+		clock.Step(time.Second)
+
+		assert.Eventually(t, func() bool {
+			return currentStatus.Load() == uint32(AppStatusHealthy)
+		}, time.Second, time.Microsecond)
+		assert.Equal(t, int64(1), probeCalls.Load())
+
+		clock.Step(time.Second)
+
+		assert.Eventually(t, func() bool {
+			return currentStatus.Load() == uint32(AppStatusUnhealthy)
+		}, time.Second, time.Microsecond)
+		assert.Equal(t, int64(2), probeCalls.Load())
+		h.Close()
+
+		select {
+		case <-done:
+		case <-time.After(time.Millisecond * 100):
+			require.Fail(t, "StartProbes didn't return in time")
+		}
+	})
 }

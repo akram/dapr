@@ -14,11 +14,12 @@ limitations under the License.
 package pubsub
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
-	"github.com/pkg/errors"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/dapr/components-contrib/pubsub"
 	daprt "github.com/dapr/dapr/pkg/testing"
@@ -66,22 +67,22 @@ func TestCreatePubSub(t *testing.T) {
 		}, pubSubNameV2)
 
 		// assert v0 and v1
-		p, e := testRegistry.Create(componentName, "v0")
-		assert.NoError(t, e)
+		p, e := testRegistry.Create(componentName, "v0", "")
+		require.NoError(t, e)
 		assert.Same(t, mockPubSub, p)
 
-		p, e = testRegistry.Create(componentName, "v1")
-		assert.NoError(t, e)
+		p, e = testRegistry.Create(componentName, "v1", "")
+		require.NoError(t, e)
 		assert.Same(t, mockPubSub, p)
 
 		// assert v2
-		pV2, e := testRegistry.Create(componentName, "v2")
-		assert.NoError(t, e)
+		pV2, e := testRegistry.Create(componentName, "v2", "")
+		require.NoError(t, e)
 		assert.Same(t, mockPubSubV2, pV2)
 
 		// check case-insensitivity
-		pV2, e = testRegistry.Create(strings.ToUpper(componentName), "V2")
-		assert.NoError(t, e)
+		pV2, e = testRegistry.Create(strings.ToUpper(componentName), "V2", "")
+		require.NoError(t, e)
 		assert.Same(t, mockPubSubV2, pV2)
 	})
 
@@ -89,8 +90,8 @@ func TestCreatePubSub(t *testing.T) {
 		const PubSubName = "fakePubSub"
 
 		// act
-		p, actualError := testRegistry.Create(createFullName(PubSubName), "v1")
-		expectedError := errors.Errorf("couldn't find message bus %s/v1", createFullName(PubSubName))
+		p, actualError := testRegistry.Create(createFullName(PubSubName), "v1", "")
+		expectedError := fmt.Errorf("couldn't find message bus %s/v1", createFullName(PubSubName))
 		// assert
 		assert.Nil(t, p)
 		assert.Equal(t, expectedError.Error(), actualError.Error())

@@ -29,9 +29,14 @@ import (
 	"github.com/dapr/dapr/tests/perf/utils"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 	"github.com/dapr/dapr/tests/runner"
+	"github.com/dapr/dapr/tests/runner/summary"
 )
 
-const numHealthChecks = 60 // Number of times to check for endpoint health per app.
+const (
+	appName = "perfstategrpc"
+	// Number of times to check for endpoint health per app.
+	numHealthChecks = 60
+)
 
 var tr *runner.TestRunner
 
@@ -40,7 +45,7 @@ func TestMain(m *testing.M) {
 
 	testApps := []kube.AppDescription{
 		{
-			AppName:           "tester",
+			AppName:           appName,
 			DaprEnabled:       true,
 			ImageName:         "perf-tester",
 			Replicas:          1,
@@ -63,11 +68,16 @@ func TestMain(m *testing.M) {
 }
 
 func TestStateGetGrpcPerformance(t *testing.T) {
-	p := perf.Params()
+	p := perf.Params(
+		perf.WithQPS(1000),
+		perf.WithConnections(16),
+		perf.WithDuration("1m"),
+		perf.WithPayloadSize(0),
+	)
 	t.Logf("running state get grpc test with params: qps=%v, connections=%v, duration=%s, payload size=%v, payload=%v", p.QPS, p.ClientConnections, p.TestDuration, p.PayloadSizeKB, p.Payload)
 
 	// Get the ingress external url of tester app
-	testerAppURL := tr.Platform.AcquireAppExternalURL("tester")
+	testerAppURL := tr.Platform.AcquireAppExternalURL(appName)
 	require.NotEmpty(t, testerAppURL, "tester app external URL must not be empty")
 
 	// Check if tester app endpoint is available
@@ -106,13 +116,13 @@ func TestStateGetGrpcPerformance(t *testing.T) {
 	// fast fail if daprResp starts with error
 	require.False(t, strings.HasPrefix(string(baselineResp), "error"))
 
-	sidecarUsage, err := tr.Platform.GetSidecarUsage("tester")
+	sidecarUsage, err := tr.Platform.GetSidecarUsage(appName)
 	require.NoError(t, err)
 
-	appUsage, err := tr.Platform.GetAppUsage("tester")
+	appUsage, err := tr.Platform.GetAppUsage(appName)
 	require.NoError(t, err)
 
-	restarts, err := tr.Platform.GetTotalRestarts("tester")
+	restarts, err := tr.Platform.GetTotalRestarts(appName)
 	require.NoError(t, err)
 
 	t.Logf("dapr sidecar consumed %vm Cpu and %vMb of Memory", sidecarUsage.CPUm, sidecarUsage.MemoryMb)
@@ -139,21 +149,26 @@ func TestStateGetGrpcPerformance(t *testing.T) {
 		t.Logf("added latency for %s percentile: %sms", v, fmt.Sprintf("%.2f", latency))
 	}
 	avg := (daprResult.DurationHistogram.Avg - baselineResult.DurationHistogram.Avg) * 1000
-	t.Logf("baseline latency avg: %sms", fmt.Sprintf("%.2f", baselineResult.DurationHistogram.Avg*1000))
-	t.Logf("dapr latency avg: %sms", fmt.Sprintf("%.2f", daprResult.DurationHistogram.Avg*1000))
+	baselineLatency := baselineResult.DurationHistogram.Avg * 1000
+	daprLatency := daprResult.DurationHistogram.Avg * 1000
+	t.Logf("baseline latency avg: %sms", fmt.Sprintf("%.2f", baselineLatency))
+	t.Logf("dapr latency avg: %sms", fmt.Sprintf("%.2f", daprLatency))
 	t.Logf("added latency avg: %sms", fmt.Sprintf("%.2f", avg))
 
-	report := perf.NewTestReport(
-		[]perf.TestResult{baselineResult, daprResult},
-		"State Get gRPC",
-		sidecarUsage,
-		appUsage)
-	report.SetTotalRestartCount(restarts)
-	err = utils.UploadAzureBlob(report)
-
-	if err != nil {
-		t.Error(err)
-	}
+	summary.ForTest(t).
+		Service(appName).
+		CPU(appUsage.CPUm).
+		Memory(appUsage.MemoryMb).
+		SidecarCPU(sidecarUsage.CPUm).
+		SidecarMemory(sidecarUsage.MemoryMb).
+		Restarts(restarts).
+		BaselineLatency(baselineLatency).
+		DaprLatency(daprLatency).
+		AddedLatency(avg).
+		ActualQPS(daprResult.ActualQPS).
+		Params(p).
+		OutputFortio(daprResult).
+		Flush()
 
 	require.Equal(t, 0, daprResult.RetCodes.Num400)
 	require.Equal(t, 0, daprResult.RetCodes.Num500)

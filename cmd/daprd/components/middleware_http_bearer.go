@@ -1,3 +1,5 @@
+//go:build allcomponents || stablecomponents
+
 /*
 Copyright 2021 The Dapr Authors
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,17 +16,19 @@ limitations under the License.
 package components
 
 import (
-	"github.com/dapr/components-contrib/middleware"
+	"context"
+
+	contribmiddleware "github.com/dapr/components-contrib/middleware"
 	"github.com/dapr/components-contrib/middleware/http/bearer"
 	httpMiddlewareLoader "github.com/dapr/dapr/pkg/components/middleware/http"
-	httpMiddleware "github.com/dapr/dapr/pkg/middleware/http"
+	"github.com/dapr/dapr/pkg/middleware"
 	"github.com/dapr/kit/logger"
 )
 
 func init() {
 	httpMiddlewareLoader.DefaultRegistry.RegisterComponent(func(log logger.Logger) httpMiddlewareLoader.FactoryMethod {
-		return func(metadata middleware.Metadata) (httpMiddleware.Middleware, error) {
-			return bearer.NewBearerMiddleware(log).GetHandler(metadata)
+		return func(metadata contribmiddleware.Metadata) (middleware.HTTP, error) {
+			return bearer.NewBearerMiddleware(log).GetHandler(context.TODO(), metadata)
 		}
 	}, "bearer")
 }

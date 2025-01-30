@@ -15,21 +15,24 @@ package utils
 
 import (
 	"context"
+	"net/http"
 	"strconv"
 
-	"github.com/valyala/fasthttp"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 
 	"github.com/dapr/kit/logger"
 )
 
+type daprContextKey string
+
 const (
 	defaultSamplingRate = 1e-4
 
-	// daprFastHTTPContextKey is the context value of span in fasthttp.RequestCtx.
-	daprFastHTTPContextKey = "daprSpanContextKey"
+	spanContextKey daprContextKey = "span"
 )
+
+var emptySpanContext trace.SpanContext
 
 // StdoutExporter implements an open telemetry span exporter that writes to stdout.
 type StdoutExporter struct {
@@ -59,6 +62,24 @@ func (e *StdoutExporter) Shutdown(ctx context.Context) error {
 	return nil
 }
 
+// NullExporter implements an open telemetry span exporter that discards all telemetry.
+type NullExporter struct{}
+
+// NewNullExporter returns a NullExporter
+func NewNullExporter() *NullExporter {
+	return &NullExporter{}
+}
+
+// ExportSpans implements the open telemetry span exporter interface.
+func (e *NullExporter) ExportSpans(ctx context.Context, spans []sdktrace.ReadOnlySpan) error {
+	return nil
+}
+
+// Shutdown implements the open telemetry span exporter interface.
+func (e *NullExporter) Shutdown(ctx context.Context) error {
+	return nil
+}
+
 // GetTraceSamplingRate parses the given rate and returns the parsed rate.
 func GetTraceSamplingRate(rate string) float64 {
 	f, err := strconv.ParseFloat(rate, 64)
@@ -68,32 +89,30 @@ func GetTraceSamplingRate(rate string) float64 {
 	return f
 }
 
-// TraceSampler returns Probability Sampler option.
-func TraceSampler(samplingRate string) sdktrace.Sampler {
-	return sdktrace.ParentBased(sdktrace.TraceIDRatioBased(GetTraceSamplingRate(samplingRate)))
-}
-
 // IsTracingEnabled parses the given rate and returns false if sampling rate is explicitly set 0.
 func IsTracingEnabled(rate string) bool {
 	return GetTraceSamplingRate(rate) != 0
 }
 
-// SpanFromContext returns the SpanContext stored in a context, or nil or trace.nooSpan{} if there isn't one. - TODO
+// SpanFromContext returns the Span stored in a context, or nil or trace.noopSpan{} if there isn't one.
 func SpanFromContext(ctx context.Context) trace.Span {
-	if reqCtx, ok := ctx.(*fasthttp.RequestCtx); ok {
-		val := reqCtx.UserValue(daprFastHTTPContextKey)
-		if val != nil {
-			return val.(trace.Span)
+	val := ctx.Value(spanContextKey)
+
+	if val != nil {
+		span, ok := val.(trace.Span)
+		if ok {
+			return span
 		}
 	}
 
-	span := trace.SpanFromContext(ctx)
-	return span
+	// Return the default span, which can be a noop
+	return trace.SpanFromContext(ctx)
 }
 
-// SpanToFastHTTPContext sets span into fasthttp.RequestCtx.
-func SpanToFastHTTPContext(ctx *fasthttp.RequestCtx, span trace.Span) {
-	ctx.SetUserValue(daprFastHTTPContextKey, span)
+// AddSpanToRequest sets span into a request context.
+func AddSpanToRequest(r *http.Request, span trace.Span) {
+	ctx := context.WithValue(r.Context(), spanContextKey, span)
+	*r = *(r.WithContext(ctx))
 }
 
 // BinaryFromSpanContext returns the binary format representation of a SpanContext.
@@ -103,7 +122,7 @@ func BinaryFromSpanContext(sc trace.SpanContext) []byte {
 	traceID := sc.TraceID()
 	spanID := sc.SpanID()
 	traceFlags := sc.TraceFlags()
-	if sc.Equal(trace.SpanContext{}) {
+	if sc.Equal(emptySpanContext) {
 		return nil
 	}
 	var b [29]byte

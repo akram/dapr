@@ -28,7 +28,7 @@ var (
 	urlFormat            = "http://localhost:%s/v1.0/healthz/outbound"
 )
 
-func waitUntilDaprOutboundReady(daprHTTPPort string) {
+func WaitUntilDaprOutboundReady(daprHTTPPort string) {
 	outboundReadyHealthURL := fmt.Sprintf(urlFormat, daprHTTPPort)
 	client := &http.Client{
 		Timeout: time.Duration(requestTimeoutMillis) * time.Millisecond,
@@ -72,7 +72,7 @@ func checkIfOutboundReady(client *http.Client, outboundReadyHealthURL string) er
 	if err != nil {
 		return err
 	}
-	if resp.StatusCode != 204 {
+	if resp.StatusCode != http.StatusNoContent {
 		return fmt.Errorf("HTTP status code %v", resp.StatusCode)
 	}
 

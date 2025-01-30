@@ -18,63 +18,88 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+
+	"github.com/dapr/dapr/pkg/config"
+	"github.com/dapr/dapr/pkg/healthz"
+	"github.com/dapr/dapr/pkg/metrics"
+	"github.com/dapr/dapr/pkg/runtime/registry"
+	"github.com/dapr/kit/ptr"
 )
 
-func TestNewConfig(t *testing.T) {
-	publicPort := DefaultDaprPublicPort
-	c := NewRuntimeConfig(NewRuntimeConfigOpts{
-		ID:                           "app1",
-		PlacementAddresses:           []string{"localhost:5050"},
-		controlPlaneAddress:          "localhost:5051",
+func Test_toInternal(t *testing.T) {
+	cfg := defaultTestConfig()
+
+	var nilDuration *time.Duration
+
+	intc, err := cfg.toInternal()
+	require.NoError(t, err)
+
+	assert.Equal(t, "app1", intc.id)
+	assert.Equal(t, "localhost:5050", intc.actorsService)
+	assert.Equal(t, "localhost:5051", intc.kubernetes.ControlPlaneAddress)
+	assert.Equal(t, "*", intc.allowedOrigins)
+	_ = assert.Len(t, intc.standalone.ResourcesPath, 1) &&
+		assert.Equal(t, "components", intc.standalone.ResourcesPath[0])
+	assert.Equal(t, "http", string(intc.appConnectionConfig.Protocol))
+	assert.Equal(t, "kubernetes", string(intc.mode))
+	assert.Equal(t, 3500, intc.httpPort)
+	assert.Equal(t, 50002, intc.internalGRPCPort)
+	assert.Equal(t, 50001, intc.apiGRPCPort)
+	assert.Equal(t, ptr.Of(3501), intc.publicPort)
+	assert.Equal(t, "1.2.3.4", intc.apiListenAddresses[0])
+	assert.Equal(t, 8080, intc.appConnectionConfig.Port)
+	assert.Equal(t, 7070, intc.profilePort)
+	assert.True(t, intc.enableProfiling)
+	assert.Equal(t, 1, intc.appConnectionConfig.MaxConcurrency)
+	assert.True(t, intc.mTLSEnabled)
+	assert.Equal(t, "localhost:5052", intc.sentryServiceAddress)
+	assert.Equal(t, 4<<20, intc.maxRequestBodySize)
+	assert.Equal(t, 4<<10, intc.readBufferSize)
+	assert.Equal(t, "", intc.unixDomainSocket)
+	assert.Equal(t, time.Second, intc.gracefulShutdownDuration)
+	assert.Equal(t, nilDuration, intc.blockShutdownDuration)
+	assert.Equal(t, ptr.Of(true), intc.enableAPILogging)
+	assert.True(t, intc.disableBuiltinK8sSecretStore)
+	assert.Equal(t, "1.1.1.1", intc.appConnectionConfig.ChannelAddress)
+}
+
+func TestStandaloneWasmStrictSandbox(t *testing.T) {
+	global, err := config.LoadStandaloneConfiguration("../config/testdata/wasm_strict_sandbox.yaml")
+
+	require.NoError(t, err)
+	assert.True(t, global.Spec.WasmSpec.StrictSandbox)
+}
+
+func defaultTestConfig() Config {
+	return Config{
+		AppID:                        "app1",
+		ActorsService:                "localhost:5050",
+		ControlPlaneAddress:          "localhost:5051",
 		AllowedOrigins:               "*",
-		GlobalConfig:                 "config",
-		ComponentsPath:               "components",
+		ResourcesPath:                []string{"components"},
 		AppProtocol:                  "http",
 		Mode:                         "kubernetes",
-		HTTPPort:                     3500,
-		InternalGRPCPort:             50002,
-		APIGRPCPort:                  50001,
-		APIListenAddresses:           []string{"1.2.3.4"},
-		PublicPort:                   &publicPort,
-		AppPort:                      8080,
-		ProfilePort:                  7070,
+		DaprHTTPPort:                 "3500",
+		DaprInternalGRPCPort:         "50002",
+		DaprAPIGRPCPort:              "50001",
+		DaprAPIListenAddresses:       "1.2.3.4",
+		DaprPublicPort:               "3501",
+		ApplicationPort:              "8080",
+		ProfilePort:                  "7070",
 		EnableProfiling:              true,
-		MaxConcurrency:               1,
-		MTLSEnabled:                  true,
+		AppMaxConcurrency:            1,
+		EnableMTLS:                   true,
 		SentryAddress:                "localhost:5052",
-		AppSSL:                       true,
-		MaxRequestBodySize:           4,
+		MaxRequestSize:               4 << 20,
+		ReadBufferSize:               4 << 10,
 		UnixDomainSocket:             "",
-		ReadBufferSize:               4,
-		GracefulShutdownDuration:     time.Second,
-		EnableAPILogging:             true,
+		DaprGracefulShutdownSeconds:  1,
+		EnableAPILogging:             ptr.Of(true),
 		DisableBuiltinK8sSecretStore: true,
-	})
-
-	assert.Equal(t, "app1", c.ID)
-	assert.Equal(t, "localhost:5050", c.PlacementAddresses[0])
-	assert.Equal(t, "localhost:5051", c.Kubernetes.ControlPlaneAddress)
-	assert.Equal(t, "*", c.AllowedOrigins)
-	assert.Equal(t, "config", c.GlobalConfig)
-	assert.Equal(t, "components", c.Standalone.ComponentsPath)
-	assert.Equal(t, "http", string(c.ApplicationProtocol))
-	assert.Equal(t, "kubernetes", string(c.Mode))
-	assert.Equal(t, 3500, c.HTTPPort)
-	assert.Equal(t, 50002, c.InternalGRPCPort)
-	assert.Equal(t, 50001, c.APIGRPCPort)
-	assert.Equal(t, &publicPort, c.PublicPort)
-	assert.Equal(t, "1.2.3.4", c.APIListenAddresses[0])
-	assert.Equal(t, 8080, c.ApplicationPort)
-	assert.Equal(t, 7070, c.ProfilePort)
-	assert.Equal(t, true, c.EnableProfiling)
-	assert.Equal(t, 1, c.MaxConcurrency)
-	assert.Equal(t, true, c.mtlsEnabled)
-	assert.Equal(t, "localhost:5052", c.SentryServiceAddress)
-	assert.Equal(t, true, c.AppSSL)
-	assert.Equal(t, 4, c.MaxRequestBodySize)
-	assert.Equal(t, "", c.UnixDomainSocket)
-	assert.Equal(t, 4, c.ReadBufferSize)
-	assert.Equal(t, time.Second, c.GracefulShutdownDuration)
-	assert.Equal(t, true, c.EnableAPILogging)
-	assert.Equal(t, true, c.DisableBuiltinK8sSecretStore)
+		AppChannelAddress:            "1.1.1.1",
+		Registry:                     registry.NewOptions(),
+		Metrics:                      metrics.Options{Enabled: false, Healthz: healthz.New()},
+		Healthz:                      healthz.New(),
+	}
 }

@@ -17,21 +17,47 @@ import (
 	"context"
 	"fmt"
 
-	"github.com/dapr/dapr/pkg/components"
-	"github.com/dapr/dapr/utils"
-
-	"github.com/pkg/errors"
+	"github.com/dapr/kit/logger"
 
 	proto "github.com/dapr/dapr/pkg/proto/components/v1"
 
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
+
+var log = logger.NewLogger("pluggable-components-grpc-connector")
 
 // GRPCClient is any client that supports common pluggable grpc operations.
 type GRPCClient interface {
 	// Ping is for liveness purposes.
 	Ping(ctx context.Context, in *proto.PingRequest, opts ...grpc.CallOption) (*proto.PingResponse, error)
+}
+
+// NewConverterFunc returns a function that maps from any error to a business error.
+// if the error is unknown it is kept as is, otherwise a converter function will be used.
+func NewConverterFunc(errorsConverters MethodErrorConverter) func(error) error {
+	return func(err error) error {
+		s, ok := status.FromError(err)
+		if !ok {
+			return err
+		}
+		convert, ok := errorsConverters[s.Code()]
+		if !ok {
+			return err
+		}
+		return convert(*s)
+	}
+}
+
+type GRPCConnectionDialer func(ctx context.Context, name string, opts ...grpc.DialOption) (*grpc.ClientConn, error)
+
+// WithOptions returns a new connection dialer that adds the new options to it.
+func (g GRPCConnectionDialer) WithOptions(newOpts ...grpc.DialOption) GRPCConnectionDialer {
+	return func(ctx context.Context, name string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+		return g(ctx, name, append(opts, newOpts...)...)
+	}
 }
 
 // GRPCConnector is a connector that uses underlying gRPC protocol for common operations.
@@ -42,46 +68,62 @@ type GRPCConnector[TClient GRPCClient] struct {
 	Cancel context.CancelFunc
 	// Client is the proto client.
 	Client        TClient
-	socketFactory func(string) string
+	dialer        GRPCConnectionDialer
 	conn          *grpc.ClientConn
 	clientFactory func(grpc.ClientConnInterface) TClient
 }
 
-const (
-	DaprSocketFolderEnvVar = "DAPR_PLUGGABLE_COMPONENTS_SOCKETS_FOLDER"
-	defaultSocketFolder    = "/var/run"
-)
+// metadataInstanceID is used to differentiate between multiples instance of the same component.
+const metadataInstanceID = "x-component-instance"
 
-// socketFactoryFor returns a socket factory that returns the socket that will be used for the given pluggable component.
-func socketFactoryFor(pc components.Pluggable) func(string) string {
-	socketPrefix := fmt.Sprintf("%s/dapr-%s.%s-%s", utils.GetEnvOrElse(DaprSocketFolderEnvVar, defaultSocketFolder), pc.Type, pc.Name, pc.Version)
-	return func(componentName string) string {
-		return fmt.Sprintf("%s-%s.sock", socketPrefix, componentName)
+// instanceIDStreamInterceptor returns a grpc client unary interceptor that adds the instanceID on outgoing metadata.
+// instanceID is used for multiplexing connection if the component supports it.
+func instanceIDUnaryInterceptor(instanceID string) grpc.UnaryClientInterceptor {
+	return func(ctx context.Context, method string, req, reply interface{}, cc *grpc.ClientConn, invoker grpc.UnaryInvoker, opts ...grpc.CallOption) error {
+		return invoker(metadata.AppendToOutgoingContext(ctx, metadataInstanceID, instanceID), method, req, reply, cc, opts...)
 	}
 }
 
-// socketPathFor returns a unique socket for the given component.
-// the socket path will be composed by the pluggable component, name, version and type plus the component name.
-func (g *GRPCConnector[TClient]) socketPathFor(componentName string) string {
-	return g.socketFactory(componentName)
+// instanceIDStreamInterceptor returns a grpc client stream interceptor that adds the instanceID on outgoing metadata.
+// instanceID is used for multiplexing connection if the component supports it.
+func instanceIDStreamInterceptor(instanceID string) grpc.StreamClientInterceptor {
+	return func(ctx context.Context, desc *grpc.StreamDesc, cc *grpc.ClientConn, method string, streamer grpc.Streamer, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+		return streamer(metadata.AppendToOutgoingContext(ctx, metadataInstanceID, instanceID), desc, cc, method, opts...)
+	}
+}
+
+// socketDialer creates a dialer for the given socket.
+func socketDialer(socket string, additionalOpts ...grpc.DialOption) GRPCConnectionDialer {
+	return func(ctx context.Context, name string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+		additionalOpts = append(additionalOpts, grpc.WithStreamInterceptor(instanceIDStreamInterceptor(name)), grpc.WithUnaryInterceptor(instanceIDUnaryInterceptor(name)))
+		return SocketDial(ctx, socket, append(additionalOpts, opts...)...)
+	}
+}
+
+// SocketDial creates a grpc connection using the given socket.
+func SocketDial(ctx context.Context, socket string, additionalOpts ...grpc.DialOption) (*grpc.ClientConn, error) {
+	udsSocket := "unix://" + socket
+	log.Debugf("using socket defined at '%s'", udsSocket)
+	additionalOpts = append(additionalOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
+
+	grpcConn, err := grpc.DialContext(ctx, udsSocket, additionalOpts...) //nolint:staticcheck
+	if err != nil {
+		return nil, fmt.Errorf("unable to open GRPC connection using socket '%s': %w", udsSocket, err)
+	}
+	return grpcConn, nil
 }
 
 // Dial opens a grpcConnection and creates a new client instance.
-func (g *GRPCConnector[TClient]) Dial(componentName string, additionalOpts ...grpc.DialOption) error {
-	udsSocket := fmt.Sprintf("unix://%s", g.socketPathFor(componentName))
-	log.Debugf("using socket defined at '%s' for the component '%s'", udsSocket, componentName)
-	// TODO Add Observability middlewares monitoring/tracing
-	additionalOpts = append(additionalOpts, grpc.WithTransportCredentials(insecure.NewCredentials()))
-
-	grpcConn, err := grpc.Dial(udsSocket, additionalOpts...)
+func (g *GRPCConnector[TClient]) Dial(name string) error {
+	grpcConn, err := g.dialer(g.Context, name)
 	if err != nil {
-		return errors.Wrapf(err, "unable to open GRPC connection using socket '%s'", udsSocket)
+		return fmt.Errorf("unable to open GRPC connection using the dialer: %w", err)
 	}
 	g.conn = grpcConn
 
 	g.Client = g.clientFactory(grpcConn)
 
-	return g.Ping()
+	return nil
 }
 
 // Ping pings the grpc component.
@@ -98,19 +140,19 @@ func (g *GRPCConnector[TClient]) Close() error {
 	return g.conn.Close()
 }
 
-// NewGRPCConnectorWithFactory creates a new grpc connector for the given client factory and socket factory.
-func NewGRPCConnectorWithFactory[TClient GRPCClient](socketFactory func(string) string, factory func(grpc.ClientConnInterface) TClient) *GRPCConnector[TClient] {
+// NewGRPCConnectorWithDialer creates a new grpc connector for the given client factory and dialer.
+func NewGRPCConnectorWithDialer[TClient GRPCClient](dialer GRPCConnectionDialer, factory func(grpc.ClientConnInterface) TClient) *GRPCConnector[TClient] {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	return &GRPCConnector[TClient]{
 		Context:       ctx,
 		Cancel:        cancel,
-		socketFactory: socketFactory,
+		dialer:        dialer,
 		clientFactory: factory,
 	}
 }
 
-// NewGRPCConnector creates a new grpc connector for the given client.
-func NewGRPCConnector[TClient GRPCClient](pc components.Pluggable, factory func(grpc.ClientConnInterface) TClient) *GRPCConnector[TClient] {
-	return NewGRPCConnectorWithFactory(socketFactoryFor(pc), factory)
+// NewGRPCConnector creates a new grpc connector for the given client factory and socket file, using the default socket dialer.
+func NewGRPCConnector[TClient GRPCClient](socket string, factory func(grpc.ClientConnInterface) TClient) *GRPCConnector[TClient] {
+	return NewGRPCConnectorWithDialer(socketDialer(socket), factory)
 }

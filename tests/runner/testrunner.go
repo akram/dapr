@@ -32,13 +32,20 @@ type runnable interface {
 	Run() int
 }
 
-// PlatformInterface defines the testing platform for test runner.
-type PlatformInterface interface {
-	setup() error
-	tearDown() error
-	addComponents(comps []kube.ComponentDescription) error
-	addApps(apps []kube.AppDescription) error
+type LoadTester interface {
+	Run(platform PlatformInterface) error
+}
 
+// PlatformInterface defines the testing platform for test runner.
+//
+//nolint:interfacebloat
+type PlatformInterface interface {
+	Setup() error
+	TearDown() error
+
+	AddComponents(comps []kube.ComponentDescription) error
+	AddApps(apps []kube.AppDescription) error
+	AddSecrets(secrets []kube.SecretDescription) error
 	AcquireAppExternalURL(name string) string
 	GetAppHostDetails(name string) (string, string, error)
 	Restart(name string) error
@@ -50,6 +57,7 @@ type PlatformInterface interface {
 	GetTotalRestarts(appname string) (int, error)
 	GetConfiguration(name string) (*configurationv1alpha1.Configuration, error)
 	GetService(name string) (*corev1.Service, error)
+	LoadTest(loadtester LoadTester) error
 }
 
 // AppUsage holds the CPU and Memory information for the application.
@@ -72,6 +80,9 @@ type TestRunner struct {
 	// TODO: Needs to define kube.AppDescription more general struct for Dapr app
 	testApps []kube.AppDescription
 
+	// secrets is the list of secrets to be created in the cluster
+	secrets []kube.SecretDescription
+
 	// Platform is the testing platform instances
 	Platform PlatformInterface
 }
@@ -90,26 +101,37 @@ func NewTestRunner(id string, apps []kube.AppDescription,
 	}
 }
 
+func (tr *TestRunner) AddSecrets(secrets []kube.SecretDescription) {
+	tr.secrets = secrets
+}
+
 // Start is the entry point of Dapr test runner.
 func (tr *TestRunner) Start(m runnable) int {
 	// TODO: Add logging and reporting initialization
 
 	// Setup testing platform
 	log.Println("Running setup...")
-	err := tr.Platform.setup()
+	err := tr.Platform.Setup()
 	defer func() {
 		log.Println("Running teardown...")
-		tr.tearDown()
+		tr.TearDown()
 	}()
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed Platform.setup(), %s", err.Error())
 		return runnerFailExitCode
 	}
 
+	if tr.secrets != nil && len(tr.secrets) > 0 {
+		if err := tr.Platform.AddSecrets(tr.secrets); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed Platform.addSecrets(), %s", err.Error())
+			return runnerFailExitCode
+		}
+	}
+
 	// Install components.
 	if tr.components != nil && len(tr.components) > 0 {
 		log.Println("Installing components...")
-		if err := tr.Platform.addComponents(tr.components); err != nil {
+		if err := tr.Platform.AddComponents(tr.components); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed Platform.addComponents(), %s", err.Error())
 			return runnerFailExitCode
 		}
@@ -120,7 +142,7 @@ func (tr *TestRunner) Start(m runnable) int {
 	// other setup work.
 	if tr.initApps != nil && len(tr.initApps) > 0 {
 		log.Println("Installing init apps...")
-		if err := tr.Platform.addApps(tr.initApps); err != nil {
+		if err := tr.Platform.AddApps(tr.initApps); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed Platform.addInitApps(), %s", err.Error())
 			return runnerFailExitCode
 		}
@@ -129,7 +151,7 @@ func (tr *TestRunner) Start(m runnable) int {
 	// Install test apps. These are the main apps that provide the actual testing.
 	if tr.testApps != nil && len(tr.testApps) > 0 {
 		log.Println("Installing test apps...")
-		if err := tr.Platform.addApps(tr.testApps); err != nil {
+		if err := tr.Platform.AddApps(tr.testApps); err != nil {
 			fmt.Fprintf(os.Stderr, "Failed Platform.addApps(), %s", err.Error())
 			return runnerFailExitCode
 		}
@@ -140,9 +162,9 @@ func (tr *TestRunner) Start(m runnable) int {
 	return m.Run()
 }
 
-func (tr *TestRunner) tearDown() {
+func (tr *TestRunner) TearDown() {
 	// Tearing down platform
-	tr.Platform.tearDown()
+	tr.Platform.TearDown()
 
 	// TODO: Add the resources which will be tearing down
 }

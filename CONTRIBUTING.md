@@ -23,7 +23,7 @@ This section describes the guidelines for submitting issues
 There are 4 types of issues:
 
 - Issue/Bug: You've found a bug with the code, and want to report it, or create an issue to track the bug.
-- Issue/Discussion: You have something on your mind, which requires input form others in a discussion, before it eventually manifests as a proposal.
+- Issue/Discussion: You have something on your mind, which requires input from others in a discussion, before it eventually manifests as a proposal.
 - Issue/Proposal: Used for items that propose a new idea or functionality. This allows feedback from others before code is written.
 - Issue/Question: Use this issue type, if you need help or have a question.
 
@@ -57,6 +57,9 @@ All contributions come through pull requests. To submit a proposed change, we re
 1. Fork the relevant repo and create a new branch
 1. Create your change
     - Code changes require tests
+    - Make sure to run the linters to check and format the code:
+        - `make lint` executes the linter for Go code
+        - `make me prettier` uses Prettier to format JavaScript / JSON files (needed only if you've modified those)
 1. Update relevant documentation for the change
 1. Commit with [DCO sign-off](#developer-certificate-of-origin-signing-your-work) and open a PR
 1. Wait for the CI process to finish and make sure all checks are green
@@ -85,14 +88,16 @@ By making a contribution to this project, I certify that:
 
 Contributors sign-off that they adhere to these requirements by adding a `Signed-off-by` line to commit messages.
 
-```
+```text
 This is my commit message
 
 Signed-off-by: Random J Developer <random@developer.example.org>
 ```
+
 Git even has a `-s` command line option to append this automatically to your commit message:
-```
-$ git commit -s -m 'This is my commit message'
+
+```sh
+git commit -s -m 'This is my commit message'
 ```
 
 Each Pull Request is checked  whether or not commits in a Pull Request do contain a valid Signed-off-by line.
@@ -101,7 +106,7 @@ Each Pull Request is checked  whether or not commits in a Pull Request do contai
 
 No worries - You can easily replay your changes, sign them and force push them!
 
-```
+```sh
 git checkout <branch-name>
 git commit --amend --no-edit --signoff
 git push --force-with-lease <remote-name> <branch-name>
@@ -110,6 +115,10 @@ git push --force-with-lease <remote-name> <branch-name>
 ### Use of Third-party code
 
 - Third-party code must include licenses.
+
+### Available GitHub Slash Commands
+
+- Available GitHub Slash Commands listed in [command-reference](https://docs.dapr.io/contributing/daprbot/#command-reference).
 
 **Thank You!** - Your contributions to open source, large or small, make projects like this possible. Thank you for taking the time to contribute.
 

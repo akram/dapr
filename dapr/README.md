@@ -1,17 +1,18 @@
 ## Overview
 
-| packages  | description                                                            |
-|-----------|------------------------------------------------------------------------|
-| common    | common protos that are imported by multiple packages                   |
-| internals | internal gRPC and protobuf definitions which is used for Dapr internal |
-| runtime   | Dapr and App Callback services and its associated protobuf messages    |
-| operator  | Dapr Operator gRPC service                                             |
-| placement | Dapr Placement service                                                 |
-| sentry    | Dapr Sentry for CA service                                             |
+| packages   | description                                                            |
+| ---------- | ---------------------------------------------------------------------- |
+| common     | common protos that are imported by multiple packages                   |
+| internals  | internal gRPC and protobuf definitions which is used for Dapr internal |
+| runtime    | Dapr and App Callback services and its associated protobuf messages    |
+| operator   | Dapr Operator gRPC service                                             |
+| placement  | Dapr Placement service                                                 |
+| sentry     | Dapr Sentry for CA service                                             |
+| components | Dapr gRPC-based components services                                    |
 
 ## Proto client generation
 
-1. Install protoc version: [v3.21.1](https://github.com/protocolbuffers/protobuf/releases/tag/v21.1) (from protobuf release 21.1)
+1. Install protoc version: [v25.4](https://github.com/protocolbuffers/protobuf/releases/tag/v25.4)
 
 2. Install protoc-gen-go and protoc-gen-go-grpc
 
@@ -21,13 +22,12 @@ make init-proto
 
 3. Generate gRPC proto clients
 
-
 ```bash
 make gen-proto
 ```
 
-
 ## Update e2e test apps
+
 Whenever there are breaking changes in the proto files, we need to update the e2e test apps to use the correct version of dapr dependencies. This can be done by navigating to the tests folder and running the commands:-
 
 ```

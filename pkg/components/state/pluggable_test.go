@@ -18,31 +18,32 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"os"
+	"runtime"
 	"sync/atomic"
 	"testing"
 
-	"github.com/dapr/components-contrib/state"
-	"github.com/dapr/components-contrib/state/query"
-	"github.com/dapr/dapr/pkg/components"
-	v1 "github.com/dapr/dapr/pkg/proto/common/v1"
-	proto "github.com/dapr/dapr/pkg/proto/components/v1"
-	"github.com/dapr/kit/logger"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/status"
-	"google.golang.org/grpc/test/bufconn"
-
+	guuid "github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-)
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/status"
 
-const bufSize = 1024 * 1024
+	contribMetadata "github.com/dapr/components-contrib/metadata"
+	"github.com/dapr/components-contrib/state"
+	"github.com/dapr/components-contrib/state/query"
+	"github.com/dapr/dapr/pkg/components/pluggable"
+	proto "github.com/dapr/dapr/pkg/proto/components/v1"
+	testingGrpc "github.com/dapr/dapr/pkg/testing/grpc"
+	"github.com/dapr/kit/logger"
+)
 
 type server struct {
 	proto.UnimplementedStateStoreServer
 	proto.UnimplementedTransactionalStateStoreServer
+	initCalled         atomic.Int64
+	featuresCalled     atomic.Int64
 	deleteCalled       atomic.Int64
 	onDeleteCalled     func(*proto.DeleteRequest)
 	deleteErr          error
@@ -144,39 +145,16 @@ func (s *server) BulkSet(ctx context.Context, req *proto.BulkSetRequest) (*proto
 }
 
 func (s *server) Init(context.Context, *proto.InitRequest) (*proto.InitResponse, error) {
-	return nil, status.Errorf(codes.Unimplemented, "method Init not implemented")
+	s.initCalled.Add(1)
+	return &proto.InitResponse{}, nil
+}
+
+func (s *server) Features(context.Context, *proto.FeaturesRequest) (*proto.FeaturesResponse, error) {
+	s.featuresCalled.Add(1)
+	return &proto.FeaturesResponse{}, nil
 }
 
 var testLogger = logger.NewLogger("state-pluggable-logger")
-
-// getStateStore returns a state store connected to the given server
-func getStateStore(srv *server) (stStore *grpcStateStore, cleanup func(), err error) {
-	lis := bufconn.Listen(bufSize)
-	s := grpc.NewServer()
-	proto.RegisterStateStoreServer(s, srv)
-	proto.RegisterTransactionalStateStoreServer(s, srv)
-	proto.RegisterQueriableStateStoreServer(s, srv)
-	go func() {
-		if serveErr := s.Serve(lis); serveErr != nil {
-			testLogger.Debugf("Server exited with error: %v", serveErr)
-		}
-	}()
-	ctx := context.Background()
-	conn, err := grpc.DialContext(ctx, "bufnet", grpc.WithContextDialer(func(ctx context.Context, s string) (net.Conn, error) {
-		return lis.Dial()
-	}), grpc.WithTransportCredentials(insecure.NewCredentials()))
-	if err != nil {
-		return nil, nil, err
-	}
-
-	client := newStateStoreClient(conn)
-	stStore = fromPluggable(testLogger, components.Pluggable{})
-	stStore.Client = client
-	return stStore, func() {
-		lis.Close()
-		conn.Close()
-	}, nil
-}
 
 // wrapString into quotes
 func wrapString(str string) string {
@@ -184,6 +162,64 @@ func wrapString(str string) string {
 }
 
 func TestComponentCalls(t *testing.T) {
+	getStateStore := func(srv *server) (statestore *grpcStateStore, cleanupf func(), err error) {
+		withSvc := testingGrpc.TestServerWithDialer(testLogger, func(s *grpc.Server, svc *server) {
+			proto.RegisterStateStoreServer(s, svc)
+			proto.RegisterTransactionalStateStoreServer(s, svc)
+			proto.RegisterQueriableStateStoreServer(s, svc)
+		})
+		dialer, cleanup, err := withSvc(srv)
+		require.NoError(t, err)
+		clientFactory := newGRPCStateStore(func(ctx context.Context, name string, opts ...grpc.DialOption) (*grpc.ClientConn, error) {
+			return dialer(ctx, opts...)
+		})
+		client := clientFactory(testLogger).(*grpcStateStore)
+		require.NoError(t, client.Init(context.Background(), state.Metadata{}))
+		return client, cleanup, err
+	}
+
+	if runtime.GOOS != "windows" {
+		t.Run("test init should populate features and call grpc init", func(t *testing.T) {
+			const (
+				fakeName          = "name"
+				fakeType          = "type"
+				fakeVersion       = "v1"
+				fakeComponentName = "component"
+				fakeSocketFolder  = "/tmp"
+			)
+
+			uniqueID := guuid.New().String()
+			socket := fmt.Sprintf("%s/%s.sock", fakeSocketFolder, uniqueID)
+			defer os.Remove(socket)
+
+			connector := pluggable.NewGRPCConnector(socket, newStateStoreClient)
+			defer connector.Close()
+
+			listener, err := net.Listen("unix", socket)
+			require.NoError(t, err)
+			defer listener.Close()
+			s := grpc.NewServer()
+			srv := &server{}
+			proto.RegisterStateStoreServer(s, srv)
+			go func() {
+				if serveErr := s.Serve(listener); serveErr != nil {
+					testLogger.Debugf("Server exited with error: %v", serveErr)
+				}
+			}()
+
+			ps := fromConnector(testLogger, connector)
+			err = ps.Init(context.Background(), state.Metadata{
+				Base: contribMetadata.Base{},
+			})
+
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), srv.featuresCalled.Load())
+			assert.Equal(t, int64(1), srv.initCalled.Load())
+		})
+	} else {
+		t.Logf("skipping pubsub pluggable component init test due to the lack of OS (%s) support", runtime.GOOS)
+	}
+
 	t.Run("features should return the component features'", func(t *testing.T) {
 		stStore, cleanup, err := getStateStore(&server{})
 		require.NoError(t, err)
@@ -191,7 +227,7 @@ func TestComponentCalls(t *testing.T) {
 		assert.Empty(t, stStore.Features())
 		stStore.features = []state.Feature{state.FeatureETag}
 		assert.NotEmpty(t, stStore.Features())
-		assert.Equal(t, stStore.Features()[0], state.FeatureETag)
+		assert.Equal(t, state.FeatureETag, stStore.Features()[0])
 	})
 
 	t.Run("delete should call delete grpc method", func(t *testing.T) {
@@ -199,13 +235,13 @@ func TestComponentCalls(t *testing.T) {
 
 		svc := &server{
 			onDeleteCalled: func(req *proto.DeleteRequest) {
-				assert.Equal(t, req.Key, fakeKey)
+				assert.Equal(t, fakeKey, req.GetKey())
 			},
 		}
 		stStore, cleanup, err := getStateStore(svc)
 		require.NoError(t, err)
 		defer cleanup()
-		err = stStore.Delete(&state.DeleteRequest{
+		err = stStore.Delete(context.Background(), &state.DeleteRequest{
 			Key: fakeKey,
 		})
 
@@ -219,18 +255,84 @@ func TestComponentCalls(t *testing.T) {
 
 		svc := &server{
 			onDeleteCalled: func(req *proto.DeleteRequest) {
-				assert.Equal(t, req.Key, fakeKey)
+				assert.Equal(t, fakeKey, req.GetKey())
 			},
 			deleteErr: fakeErr,
 		}
 		stStore, cleanup, err := getStateStore(svc)
 		require.NoError(t, err)
 		defer cleanup()
-		err = stStore.Delete(&state.DeleteRequest{
+		err = stStore.Delete(context.Background(), &state.DeleteRequest{
 			Key: fakeKey,
 		})
 
-		assert.NotNil(t, err)
+		require.Error(t, err)
+		assert.Equal(t, int64(1), svc.deleteCalled.Load())
+	})
+
+	t.Run("delete should return etag mismatch err when grpc delete returns etag mismatch code", func(t *testing.T) {
+		const fakeKey = "fakeKey"
+		st := status.New(GRPCCodeETagMismatch, "fake-err-msg")
+		desc := "The ETag field must only contain alphanumeric characters"
+		v := &errdetails.BadRequest_FieldViolation{
+			Field:       etagField,
+			Description: desc,
+		}
+		br := &errdetails.BadRequest{}
+		br.FieldViolations = append(br.GetFieldViolations(), v)
+		st, err := st.WithDetails(br)
+		require.NoError(t, err)
+
+		svc := &server{
+			onDeleteCalled: func(req *proto.DeleteRequest) {
+				assert.Equal(t, fakeKey, req.GetKey())
+			},
+			deleteErr: st.Err(),
+		}
+		stStore, cleanup, err := getStateStore(svc)
+		require.NoError(t, err)
+		defer cleanup()
+		err = stStore.Delete(context.Background(), &state.DeleteRequest{
+			Key: fakeKey,
+		})
+
+		require.Error(t, err)
+		etag, ok := err.(*state.ETagError)
+		require.True(t, ok)
+		assert.Equal(t, state.ETagMismatch, etag.Kind())
+		assert.Equal(t, int64(1), svc.deleteCalled.Load())
+	})
+
+	t.Run("delete should return etag invalid err when grpc delete returns etag invalid code", func(t *testing.T) {
+		const fakeKey = "fakeKey"
+		st := status.New(GRPCCodeETagInvalid, "fake-err-msg")
+		desc := "The ETag field must only contain alphanumeric characters"
+		v := &errdetails.BadRequest_FieldViolation{
+			Field:       etagField,
+			Description: desc,
+		}
+		br := &errdetails.BadRequest{}
+		br.FieldViolations = append(br.GetFieldViolations(), v)
+		st, err := st.WithDetails(br)
+		require.NoError(t, err)
+
+		svc := &server{
+			onDeleteCalled: func(req *proto.DeleteRequest) {
+				assert.Equal(t, fakeKey, req.GetKey())
+			},
+			deleteErr: st.Err(),
+		}
+		stStore, cleanup, err := getStateStore(svc)
+		require.NoError(t, err)
+		defer cleanup()
+		err = stStore.Delete(context.Background(), &state.DeleteRequest{
+			Key: fakeKey,
+		})
+
+		require.Error(t, err)
+		etag, ok := err.(*state.ETagError)
+		require.True(t, ok)
+		assert.Equal(t, state.ETagInvalid, etag.Kind())
 		assert.Equal(t, int64(1), svc.deleteCalled.Load())
 	})
 
@@ -239,7 +341,7 @@ func TestComponentCalls(t *testing.T) {
 
 		svc := &server{
 			onGetCalled: func(req *proto.GetRequest) {
-				assert.Equal(t, req.Key, fakeKey)
+				assert.Equal(t, fakeKey, req.GetKey())
 			},
 			getErr: errors.New("my-fake-err"),
 		}
@@ -247,11 +349,11 @@ func TestComponentCalls(t *testing.T) {
 		require.NoError(t, err)
 		defer cleanup()
 
-		resp, err := stStore.Get(&state.GetRequest{
+		resp, err := stStore.Get(context.Background(), &state.GetRequest{
 			Key: fakeKey,
 		})
 
-		assert.NotNil(t, err)
+		require.Error(t, err)
 		assert.Equal(t, int64(1), svc.getCalled.Load())
 		assert.Nil(t, resp)
 	})
@@ -261,20 +363,25 @@ func TestComponentCalls(t *testing.T) {
 
 		svc := &server{
 			onGetCalled: func(req *proto.GetRequest) {
-				assert.Equal(t, req.Key, fakeKey)
+				assert.Equal(t, fakeKey, req.GetKey())
 			},
 		}
 		stStore, cleanup, err := getStateStore(svc)
 		require.NoError(t, err)
 		defer cleanup()
 
-		resp, err := stStore.Get(&state.GetRequest{
+		resp, err := stStore.Get(context.Background(), &state.GetRequest{
 			Key: fakeKey,
 		})
 
-		assert.NotNil(t, err)
+		require.NoError(t, err)
+		assert.Equal(t, &state.GetResponse{}, resp)
 		assert.Equal(t, int64(1), svc.getCalled.Load())
-		assert.Nil(t, resp)
+		assert.NotNil(t, resp)
+		assert.Nil(t, resp.Data)
+		assert.Nil(t, resp.Metadata)
+		assert.Nil(t, resp.ContentType)
+		assert.Nil(t, resp.ETag)
 	})
 
 	t.Run("get should return get response when response is returned from the grpc call", func(t *testing.T) {
@@ -283,7 +390,7 @@ func TestComponentCalls(t *testing.T) {
 
 		svc := &server{
 			onGetCalled: func(req *proto.GetRequest) {
-				assert.Equal(t, req.Key, fakeKey)
+				assert.Equal(t, fakeKey, req.GetKey())
 			},
 			getResponse: &proto.GetResponse{
 				Data: fakeData,
@@ -293,7 +400,7 @@ func TestComponentCalls(t *testing.T) {
 		require.NoError(t, err)
 		defer cleanup()
 
-		resp, err := stStore.Get(&state.GetRequest{
+		resp, err := stStore.Get(context.Background(), &state.GetRequest{
 			Key: fakeKey,
 		})
 
@@ -307,8 +414,8 @@ func TestComponentCalls(t *testing.T) {
 
 		svc := &server{
 			onSetCalled: func(req *proto.SetRequest) {
-				assert.Equal(t, req.Key, fakeKey)
-				assert.Equal(t, req.Value, []byte(wrapString(fakeData)))
+				assert.Equal(t, fakeKey, req.GetKey())
+				assert.Equal(t, []byte(wrapString(fakeData)), req.GetValue())
 			},
 			setErr: errors.New("fake-set-err"),
 		}
@@ -316,12 +423,12 @@ func TestComponentCalls(t *testing.T) {
 		require.NoError(t, err)
 		defer cleanup()
 
-		err = stStore.Set(&state.SetRequest{
+		err = stStore.Set(context.Background(), &state.SetRequest{
 			Key:   fakeKey,
 			Value: fakeData,
 		})
 
-		assert.NotNil(t, err)
+		require.Error(t, err)
 		assert.Equal(t, int64(1), svc.setCalled.Load())
 	})
 
@@ -330,15 +437,15 @@ func TestComponentCalls(t *testing.T) {
 
 		svc := &server{
 			onSetCalled: func(req *proto.SetRequest) {
-				assert.Equal(t, req.Key, fakeKey)
-				assert.Equal(t, req.Value, []byte(wrapString(fakeData)))
+				assert.Equal(t, fakeKey, req.GetKey())
+				assert.Equal(t, []byte(wrapString(fakeData)), req.GetValue())
 			},
 		}
 		stStore, cleanup, err := getStateStore(svc)
 		require.NoError(t, err)
 		defer cleanup()
 
-		err = stStore.Set(&state.SetRequest{
+		err = stStore.Set(context.Background(), &state.SetRequest{
 			Key:   fakeKey,
 			Value: fakeData,
 		})
@@ -369,7 +476,7 @@ func TestComponentCalls(t *testing.T) {
 
 		err = stStore.Ping()
 
-		assert.NotNil(t, err)
+		require.Error(t, err)
 		assert.Equal(t, int64(1), svc.pingCalled.Load())
 	})
 
@@ -381,9 +488,9 @@ func TestComponentCalls(t *testing.T) {
 		require.NoError(t, err)
 		defer cleanup()
 
-		err = stStore.BulkSet([]state.SetRequest{})
+		err = stStore.BulkSet(context.Background(), []state.SetRequest{}, state.BulkStoreOpts{})
 
-		assert.NotNil(t, err)
+		require.Error(t, err)
 		assert.Equal(t, int64(1), svc.bulkSetCalled.Load())
 	})
 
@@ -402,9 +509,9 @@ func TestComponentCalls(t *testing.T) {
 		require.NoError(t, err)
 		defer cleanup()
 
-		err = stStore.BulkSet(requests)
+		err = stStore.BulkSet(context.Background(), requests, state.BulkStoreOpts{})
 
-		assert.ErrorIs(t, ErrNilSetValue, err)
+		require.ErrorIs(t, ErrNilSetValue, err)
 		assert.Equal(t, int64(0), svc.bulkSetCalled.Load())
 	})
 
@@ -422,14 +529,14 @@ func TestComponentCalls(t *testing.T) {
 		}
 		svc := &server{
 			onBulkSetCalled: func(bsr *proto.BulkSetRequest) {
-				assert.Len(t, bsr.Items, len(requests))
+				assert.Len(t, bsr.GetItems(), len(requests))
 			},
 		}
 		stStore, cleanup, err := getStateStore(svc)
 		require.NoError(t, err)
 		defer cleanup()
 
-		err = stStore.BulkSet(requests)
+		err = stStore.BulkSet(context.Background(), requests, state.BulkStoreOpts{})
 
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), svc.bulkSetCalled.Load())
@@ -447,14 +554,14 @@ func TestComponentCalls(t *testing.T) {
 		}
 		svc := &server{
 			onBulkDeleteCalled: func(bsr *proto.BulkDeleteRequest) {
-				assert.Len(t, bsr.Items, len(requests))
+				assert.Len(t, bsr.GetItems(), len(requests))
 			},
 		}
 		stStore, cleanup, err := getStateStore(svc)
 		require.NoError(t, err)
 		defer cleanup()
 
-		err = stStore.BulkDelete(requests)
+		err = stStore.BulkDelete(context.Background(), requests, state.BulkStoreOpts{})
 
 		require.NoError(t, err)
 		assert.Equal(t, int64(1), svc.bulkDeleteCalled.Load())
@@ -469,16 +576,50 @@ func TestComponentCalls(t *testing.T) {
 		svc := &server{
 			bulkDeleteErr: errors.New("fake-bulk-delete-err"),
 			onBulkDeleteCalled: func(bsr *proto.BulkDeleteRequest) {
-				assert.Len(t, bsr.Items, len(requests))
+				assert.Len(t, bsr.GetItems(), len(requests))
 			},
 		}
 		stStore, cleanup, err := getStateStore(svc)
 		require.NoError(t, err)
 		defer cleanup()
 
-		err = stStore.BulkDelete(requests)
+		err = stStore.BulkDelete(context.Background(), requests, state.BulkStoreOpts{})
 
-		assert.NotNil(t, err)
+		require.Error(t, err)
+		assert.Equal(t, int64(1), svc.bulkDeleteCalled.Load())
+	})
+
+	t.Run("bulkDelete should return bulkDeleteRowMismatchError when grpc bulkDelete returns a grpcCodeBulkDeleteRowMismatchError", func(t *testing.T) {
+		requests := []state.DeleteRequest{
+			{
+				Key: "fake",
+			},
+		}
+
+		st := status.New(GRPCCodeBulkDeleteRowMismatch, "fake-err-msg")
+		br := &errdetails.ErrorInfo{}
+		br.Metadata = map[string]string{
+			affectedRowsMetadataKey: "100",
+			expectedRowsMetadataKey: "99",
+		}
+		st, err := st.WithDetails(br)
+		require.NoError(t, err)
+
+		svc := &server{
+			bulkDeleteErr: st.Err(),
+			onBulkDeleteCalled: func(bsr *proto.BulkDeleteRequest) {
+				assert.Len(t, bsr.GetItems(), len(requests))
+			},
+		}
+		stStore, cleanup, err := getStateStore(svc)
+		require.NoError(t, err)
+		defer cleanup()
+
+		err = stStore.BulkDelete(context.Background(), requests, state.BulkStoreOpts{})
+
+		require.Error(t, err)
+		_, ok := err.(*state.BulkDeleteRowMismatchError)
+		require.True(t, ok)
 		assert.Equal(t, int64(1), svc.bulkDeleteCalled.Load())
 	})
 
@@ -495,10 +636,9 @@ func TestComponentCalls(t *testing.T) {
 		require.NoError(t, err)
 		defer cleanup()
 
-		got, resp, err := stStore.BulkGet(requests)
+		resp, err := stStore.BulkGet(context.Background(), requests, state.BulkGetOpts{})
 
-		assert.NotNil(t, err)
-		assert.False(t, got)
+		require.Error(t, err)
 		assert.Nil(t, resp)
 		assert.Equal(t, int64(1), svc.bulkGetCalled.Load())
 	})
@@ -517,24 +657,21 @@ func TestComponentCalls(t *testing.T) {
 			Key: fakeKey,
 		}, {Key: otherFakeKey}}
 
-		const gotValue = false
 		svc := &server{
 			onBulkGetCalled: func(bsr *proto.BulkGetRequest) {
-				assert.Len(t, bsr.Items, len(requests))
+				assert.Len(t, bsr.GetItems(), len(requests))
 			},
 			bulkGetResponse: &proto.BulkGetResponse{
 				Items: respItems,
-				Got:   gotValue,
 			},
 		}
 		stStore, cleanup, err := getStateStore(svc)
 		require.NoError(t, err)
 		defer cleanup()
 
-		got, resp, err := stStore.BulkGet(requests)
+		resp, err := stStore.BulkGet(context.Background(), requests, state.BulkGetOpts{})
 
 		require.NoError(t, err)
-		assert.Equal(t, got, gotValue)
 		assert.NotNil(t, resp)
 		assert.Len(t, resp, len(requests))
 		assert.Equal(t, int64(1), svc.bulkGetCalled.Load())
@@ -548,12 +685,12 @@ func TestComponentCalls(t *testing.T) {
 		require.NoError(t, err)
 		defer cleanup()
 
-		err = stStore.Multi(&state.TransactionalStateRequest{
+		err = stStore.Multi(context.Background(), &state.TransactionalStateRequest{
 			Operations: []state.TransactionalStateOperation{},
 			Metadata:   map[string]string{},
 		})
 
-		assert.NotNil(t, err)
+		require.Error(t, err)
 		assert.Equal(t, int64(1), svc.transactCalled.Load())
 	})
 
@@ -571,21 +708,17 @@ func TestComponentCalls(t *testing.T) {
 		}
 		svc := &server{
 			onTransactCalled: func(bsr *proto.TransactionalStateRequest) {
-				assert.Len(t, bsr.Operations, len(operations))
+				assert.Len(t, bsr.GetOperations(), len(operations))
 			},
 		}
 		stStore, cleanup, err := getStateStore(svc)
 		require.NoError(t, err)
 		defer cleanup()
 
-		err = stStore.Multi(&state.TransactionalStateRequest{
+		err = stStore.Multi(context.Background(), &state.TransactionalStateRequest{
 			Operations: []state.TransactionalStateOperation{
-				{
-					Request: operations[0],
-				},
-				{
-					Request: operations[1],
-				},
+				operations[0],
+				operations[1],
 			},
 		})
 
@@ -601,9 +734,9 @@ func TestComponentCalls(t *testing.T) {
 		require.NoError(t, err)
 		defer cleanup()
 
-		resp, err := stStore.Query(&state.QueryRequest{})
+		resp, err := stStore.Query(context.Background(), &state.QueryRequest{})
 
-		assert.NotNil(t, err)
+		require.Error(t, err)
 		assert.Nil(t, resp)
 		assert.Equal(t, int64(1), svc.queryCalled.Load())
 	})
@@ -614,7 +747,9 @@ func TestComponentCalls(t *testing.T) {
 		}
 		request := &state.QueryRequest{
 			Query: query.Query{
-				Filters: filters,
+				QueryFields: query.QueryFields{
+					Filters: filters,
+				},
 			},
 			Metadata: map[string]string{},
 		}
@@ -622,14 +757,14 @@ func TestComponentCalls(t *testing.T) {
 			{
 				Key:         "",
 				Data:        []byte{},
-				Etag:        &v1.Etag{},
+				Etag:        &proto.Etag{},
 				Error:       "",
 				ContentType: "",
 			},
 		}
 		svc := &server{
 			onQueryCalled: func(bsr *proto.QueryRequest) {
-				assert.Len(t, bsr.Query.Filter, len(filters))
+				assert.Len(t, bsr.GetQuery().GetFilter(), len(filters))
 			},
 			queryResp: &proto.QueryResponse{
 				Items: results,
@@ -639,7 +774,7 @@ func TestComponentCalls(t *testing.T) {
 		require.NoError(t, err)
 		defer cleanup()
 
-		resp, err := stStore.Query(request)
+		resp, err := stStore.Query(context.Background(), request)
 
 		require.NoError(t, err)
 		assert.NotNil(t, resp)
@@ -651,21 +786,21 @@ func TestComponentCalls(t *testing.T) {
 //nolint:nosnakecase
 func TestMappers(t *testing.T) {
 	t.Run("consistencyOf should return unspecified for unknown consistency", func(t *testing.T) {
-		assert.Equal(t, v1.StateOptions_CONSISTENCY_UNSPECIFIED, consistencyOf(""))
+		assert.Equal(t, proto.StateOptions_CONSISTENCY_UNSPECIFIED, consistencyOf(""))
 	})
 
 	t.Run("consistencyOf should return proper consistency when well-known consistency is used", func(t *testing.T) {
-		assert.Equal(t, v1.StateOptions_CONSISTENCY_EVENTUAL, consistencyOf(state.Eventual))
-		assert.Equal(t, v1.StateOptions_CONSISTENCY_STRONG, consistencyOf(state.Strong))
+		assert.Equal(t, proto.StateOptions_CONSISTENCY_EVENTUAL, consistencyOf(state.Eventual))
+		assert.Equal(t, proto.StateOptions_CONSISTENCY_STRONG, consistencyOf(state.Strong))
 	})
 
 	t.Run("concurrencyOf should return unspecified for unknown concurrency", func(t *testing.T) {
-		assert.Equal(t, v1.StateOptions_CONCURRENCY_UNSPECIFIED, concurrencyOf(""))
+		assert.Equal(t, proto.StateOptions_CONCURRENCY_UNSPECIFIED, concurrencyOf(""))
 	})
 
 	t.Run("concurrencyOf should return proper concurrency when well-known concurrency is used", func(t *testing.T) {
-		assert.Equal(t, v1.StateOptions_CONCURRENCY_FIRST_WRITE, concurrencyOf(state.FirstWrite))
-		assert.Equal(t, v1.StateOptions_CONCURRENCY_LAST_WRITE, concurrencyOf(state.LastWrite))
+		assert.Equal(t, proto.StateOptions_CONCURRENCY_FIRST_WRITE, concurrencyOf(state.FirstWrite))
+		assert.Equal(t, proto.StateOptions_CONCURRENCY_LAST_WRITE, concurrencyOf(state.LastWrite))
 	})
 
 	t.Run("toGetRequest should return nil when receiving a nil request", func(t *testing.T) {
@@ -683,9 +818,9 @@ func TestMappers(t *testing.T) {
 				Consistency: state.Eventual,
 			},
 		})
-		assert.Equal(t, getRequest.Key, fakeKey)
-		assert.Equal(t, getRequest.Metadata[fakeKey], fakeKey)
-		assert.Equal(t, getRequest.Consistency, v1.StateOptions_CONSISTENCY_EVENTUAL)
+		assert.Equal(t, fakeKey, getRequest.GetKey())
+		assert.Equal(t, fakeKey, getRequest.GetMetadata()[fakeKey])
+		assert.Equal(t, proto.StateOptions_CONSISTENCY_EVENTUAL, getRequest.GetConsistency())
 	})
 
 	t.Run("fromGetResponse should map all properties from the given response", func(t *testing.T) {
@@ -694,7 +829,7 @@ func TestMappers(t *testing.T) {
 		fakeETag := "etag"
 		resp := fromGetResponse(&proto.GetResponse{
 			Data: fakeData,
-			Etag: &v1.Etag{
+			Etag: &proto.Etag{
 				Value: fakeETag,
 			},
 			Metadata: map[string]string{
@@ -713,7 +848,7 @@ func TestMappers(t *testing.T) {
 		fakeETag := "this"
 		etagRequest := toETagRequest(&fakeETag)
 		assert.NotNil(t, etagRequest)
-		assert.Equal(t, etagRequest.Value, fakeETag)
+		assert.Equal(t, etagRequest.GetValue(), fakeETag)
 	})
 
 	t.Run("fromETagResponse should return nil when receiving a nil etag response", func(t *testing.T) {
@@ -750,14 +885,14 @@ func TestMappers(t *testing.T) {
 			})
 			require.NoError(t, err)
 			assert.NotNil(t, req)
-			assert.Equal(t, req.Key, fakeKey)
-			assert.NotNil(t, req.Value)
+			assert.Equal(t, fakeKey, req.GetKey())
+			assert.NotNil(t, req.GetValue())
 			if v, ok := fakeValue.(string); ok {
-				assert.Equal(t, string(req.Value), wrapString(v))
+				assert.Equal(t, string(req.GetValue()), wrapString(v))
 			}
-			assert.Equal(t, req.Metadata[fakeKey], fakePropValue)
-			assert.Equal(t, req.Options.Concurrency, v1.StateOptions_CONCURRENCY_LAST_WRITE)
-			assert.Equal(t, req.Options.Consistency, v1.StateOptions_CONSISTENCY_EVENTUAL)
+			assert.Equal(t, fakePropValue, req.GetMetadata()[fakeKey])
+			assert.Equal(t, proto.StateOptions_CONCURRENCY_LAST_WRITE, req.GetOptions().GetConcurrency())
+			assert.Equal(t, proto.StateOptions_CONSISTENCY_EVENTUAL, req.GetOptions().GetConsistency())
 		}
 	})
 
@@ -779,43 +914,51 @@ func TestMappers(t *testing.T) {
 			})
 			require.NoError(t, err)
 			assert.NotNil(t, req)
-			assert.Equal(t, req.Key, fakeKey)
-			assert.NotNil(t, req.Value)
-			assert.Equal(t, req.Metadata[fakeKey], fakePropValue)
-			assert.Equal(t, req.Options.Concurrency, v1.StateOptions_CONCURRENCY_LAST_WRITE)
-			assert.Equal(t, req.Options.Consistency, v1.StateOptions_CONSISTENCY_EVENTUAL)
+			assert.Equal(t, fakeKey, req.GetKey())
+			assert.NotNil(t, req.GetValue())
+			assert.Equal(t, fakePropValue, req.GetMetadata()[fakeKey])
+			assert.Equal(t, proto.StateOptions_CONCURRENCY_LAST_WRITE, req.GetOptions().GetConcurrency())
+			assert.Equal(t, proto.StateOptions_CONSISTENCY_EVENTUAL, req.GetOptions().GetConsistency())
 		}
 
 		t.Run("toTransact should return err when type is unrecognized", func(t *testing.T) {
-			req, err := toTransactOperation(state.TransactionalStateOperation{
-				Request: make(map[struct{}]struct{}),
-			})
+			req, err := toTransactOperation(failingTransactOperation{})
 			assert.Nil(t, req)
-			assert.ErrorIs(t, err, ErrTransactOperationNotSupported)
+			require.ErrorIs(t, err, ErrTransactOperationNotSupported)
 		})
 
 		t.Run("toTransact should return set operation when type is SetOperation", func(t *testing.T) {
 			const fakeData = "fakeData"
-			req, err := toTransactOperation(state.TransactionalStateOperation{
-				Request: state.SetRequest{
-					Key:   fakeKey,
-					Value: fakeData,
-				},
+			req, err := toTransactOperation(state.SetRequest{
+				Key:   fakeKey,
+				Value: fakeData,
 			})
 			require.NoError(t, err)
 			assert.NotNil(t, req)
-			assert.IsType(t, &proto.TransactionalStateOperation_Set{}, req.Request)
+			assert.IsType(t, &proto.TransactionalStateOperation_Set{}, req.GetRequest())
 		})
 
 		t.Run("toTransact should return delete operation when type is SetOperation", func(t *testing.T) {
-			req, err := toTransactOperation(state.TransactionalStateOperation{
-				Request: state.DeleteRequest{
-					Key: fakeKey,
-				},
+			req, err := toTransactOperation(state.DeleteRequest{
+				Key: fakeKey,
 			})
 			require.NoError(t, err)
 			assert.NotNil(t, req)
-			assert.IsType(t, &proto.TransactionalStateOperation_Delete{}, req.Request)
+			assert.IsType(t, &proto.TransactionalStateOperation_Delete{}, req.GetRequest())
 		})
 	})
+}
+
+type failingTransactOperation struct{}
+
+func (failingTransactOperation) Operation() state.OperationType {
+	return "unknown"
+}
+
+func (failingTransactOperation) GetKey() string {
+	return "unknown"
+}
+
+func (failingTransactOperation) GetMetadata() map[string]string {
+	return nil
 }

@@ -14,40 +14,14 @@ limitations under the License.
 package utils
 
 import (
+	"net"
 	"os"
+	"runtime"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
-
-func TestToISO8601DateTimeString(t *testing.T) {
-	t.Run("succeed to convert time.Time to ISO8601 datetime string", func(t *testing.T) {
-		testDateTime, err := time.Parse(time.RFC3339, "2020-01-02T15:04:05.123Z")
-		assert.NoError(t, err)
-		isoString := ToISO8601DateTimeString(testDateTime)
-		assert.Equal(t, "2020-01-02T15:04:05.123Z", isoString)
-	})
-
-	t.Run("succeed to parse generated iso8601 string to time.Time using RFC3339 Parser", func(t *testing.T) {
-		currentTime := time.Unix(1623306411, 123000)
-		assert.Equal(t, 123000, currentTime.UTC().Nanosecond())
-		isoString := ToISO8601DateTimeString(currentTime)
-		assert.Equal(t, "2021-06-10T06:26:51.000123Z", isoString)
-		parsed, err := time.Parse(time.RFC3339, isoString)
-
-		// assert
-		assert.NoError(t, err)
-		assert.Equal(t, currentTime.UTC().Year(), parsed.Year())
-		assert.Equal(t, currentTime.UTC().Month(), parsed.Month())
-		assert.Equal(t, currentTime.UTC().Day(), parsed.Day())
-		assert.Equal(t, currentTime.UTC().Hour(), parsed.Hour())
-		assert.Equal(t, currentTime.UTC().Minute(), parsed.Minute())
-		assert.Equal(t, currentTime.UTC().Second(), parsed.Second())
-		assert.Equal(t, currentTime.UTC().Nanosecond()/1000, parsed.Nanosecond()/1000)
-	})
-}
 
 func TestContains(t *testing.T) {
 	type customType struct {
@@ -79,36 +53,46 @@ func TestSetEnvVariables(t *testing.T) {
 		err := SetEnvVariables(map[string]string{
 			"testKey": "testValue",
 		})
-		assert.Nil(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, "testValue", os.Getenv("testKey"))
 	})
 	t.Run("set environment variables failed", func(t *testing.T) {
 		err := SetEnvVariables(map[string]string{
 			"": "testValue",
 		})
-		assert.NotNil(t, err)
+		require.Error(t, err)
 		assert.NotEqual(t, "testValue", os.Getenv(""))
 	})
 }
 
-func TestIsYaml(t *testing.T) {
-	testCases := []struct {
-		input    string
-		expected bool
+func TestGetIntValFromStringVal(t *testing.T) {
+	tcs := []struct {
+		name     string
+		val      int
+		def      int
+		expected int
 	}{
 		{
-			input:    "a.yaml",
-			expected: true,
-		}, {
-			input:    "a.yml",
-			expected: true,
-		}, {
-			input:    "a.txt",
-			expected: false,
+			name:     "value is not provided by user, default value is used",
+			val:      0,
+			def:      5,
+			expected: 5,
+		},
+		{
+			name:     "val is provided by user",
+			val:      91,
+			def:      5,
+			expected: 91,
 		},
 	}
-	for _, tc := range testCases {
-		assert.Equal(t, IsYaml(tc.input), tc.expected)
+
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			actual := GetIntValOrDefault(tc.val, tc.def)
+			if actual != tc.expected {
+				t.Errorf("expected %d, actual %d", tc.expected, actual)
+			}
+		})
 	}
 }
 
@@ -117,14 +101,204 @@ func TestEnvOrElse(t *testing.T) {
 		const elseValue, fakeEnVar = "fakeValue", "envVarThatDoesntExists"
 		require.NoError(t, os.Unsetenv(fakeEnVar))
 
-		assert.Equal(t, GetEnvOrElse(fakeEnVar, elseValue), elseValue)
+		assert.Equal(t, elseValue, GetEnvOrElse(fakeEnVar, elseValue))
 	})
 
-	t.Run("envOrElse should return env var value value when env var is present", func(t *testing.T) {
+	t.Run("envOrElse should return env var value when env var is present", func(t *testing.T) {
 		const elseValue, fakeEnVar, fakeEnvVarValue = "fakeValue", "envVarThatExists", "envVarValue"
 		defer os.Unsetenv(fakeEnVar)
 
 		require.NoError(t, os.Setenv(fakeEnVar, fakeEnvVarValue))
-		assert.Equal(t, GetEnvOrElse(fakeEnVar, elseValue), fakeEnvVarValue)
+		assert.Equal(t, fakeEnvVarValue, GetEnvOrElse(fakeEnVar, elseValue))
 	})
+}
+
+func TestSocketExists(t *testing.T) {
+	// Unix Domain Socket does not work on windows.
+	if runtime.GOOS == "windows" {
+		return
+	}
+	t.Run("socket exists should return false if file does not exists", func(t *testing.T) {
+		assert.False(t, SocketExists("/fake/path"))
+	})
+
+	t.Run("socket exists should return false if file exists but it's not a socket", func(t *testing.T) {
+		file, err := os.CreateTemp("/tmp", "prefix")
+		require.NoError(t, err)
+		defer os.Remove(file.Name())
+
+		assert.False(t, SocketExists(file.Name()))
+	})
+
+	t.Run("socket exists should return true if file exists and its a socket", func(t *testing.T) {
+		const fileName = "/tmp/socket1234.sock"
+		defer os.Remove(fileName)
+		listener, err := net.Listen("unix", fileName)
+		require.NoError(t, err)
+		defer listener.Close()
+
+		assert.True(t, SocketExists(fileName))
+	})
+}
+
+func TestPopulateMetadataForBulkPublishEntry(t *testing.T) {
+	entryMeta := map[string]string{
+		"key1": "val1",
+		"ttl":  "22s",
+	}
+
+	t.Run("req Meta does not contain any key present in entryMeta", func(t *testing.T) {
+		reqMeta := map[string]string{
+			"rawPayload": "true",
+			"key2":       "val2",
+		}
+		resMeta := PopulateMetadataForBulkPublishEntry(reqMeta, entryMeta)
+		assert.Len(t, resMeta, 4, "expected length to match")
+		assert.Contains(t, resMeta, "key1", "expected key to be present")
+		assert.Equal(t, "val1", resMeta["key1"], "expected val to be equal")
+		assert.Contains(t, resMeta, "key2", "expected key to be present")
+		assert.Equal(t, "val2", resMeta["key2"], "expected val to be equal")
+		assert.Contains(t, resMeta, "ttl", "expected key to be present")
+		assert.Equal(t, "22s", resMeta["ttl"], "expected val to be equal")
+		assert.Contains(t, resMeta, "rawPayload", "expected key to be present")
+		assert.Equal(t, "true", resMeta["rawPayload"], "expected val to be equal")
+	})
+	t.Run("req Meta contains key present in entryMeta", func(t *testing.T) {
+		reqMeta := map[string]string{
+			"ttl":  "1m",
+			"key2": "val2",
+		}
+		resMeta := PopulateMetadataForBulkPublishEntry(reqMeta, entryMeta)
+		assert.Len(t, resMeta, 3, "expected length to match")
+		assert.Contains(t, resMeta, "key1", "expected key to be present")
+		assert.Equal(t, "val1", resMeta["key1"], "expected val to be equal")
+		assert.Contains(t, resMeta, "key2", "expected key to be present")
+		assert.Equal(t, "val2", resMeta["key2"], "expected val to be equal")
+		assert.Contains(t, resMeta, "ttl", "expected key to be present")
+		assert.Equal(t, "22s", resMeta["ttl"], "expected val to be equal")
+	})
+}
+
+func TestFilter(t *testing.T) {
+	t.Run("should filter out empty values", func(t *testing.T) {
+		in := []string{"", "a", "", "b", "", "c"}
+		out := Filter(in, func(s string) bool {
+			return s != ""
+		})
+		assert.Len(t, in, 6)
+		assert.Len(t, out, 3)
+		assert.Equal(t, []string{"a", "b", "c"}, out)
+	})
+	t.Run("should filter out empty values and return empty collection if all values are filtered out", func(t *testing.T) {
+		in := []string{"", "", ""}
+		out := Filter(in, func(s string) bool {
+			return s != ""
+		})
+		assert.Len(t, in, 3)
+		assert.Empty(t, out)
+	})
+}
+
+func TestContainsPrefixed(t *testing.T) {
+	tcs := []struct {
+		name     string
+		prefixes []string
+		v        string
+		want     bool
+	}{
+		{
+			name: "empty",
+			v:    "some-service-account-name",
+			want: false,
+		},
+		{
+			name:     "notFound",
+			v:        "some-service-account-name",
+			prefixes: []string{"service-account-name", "other-service-account-name"},
+			want:     false,
+		},
+		{
+			name:     "one",
+			v:        "some-service-account-name",
+			prefixes: []string{"service-account-name", "some-service-account-name"},
+			want:     true,
+		},
+	}
+	for _, tc := range tcs {
+		t.Run(tc.name, func(t *testing.T) {
+			assert.Equalf(t, tc.want, ContainsPrefixed(tc.prefixes, tc.v), "ContainsPrefixed(%v, %v)", tc.prefixes, tc.v)
+		})
+	}
+}
+
+func TestMapToSlice(t *testing.T) {
+	t.Run("mapStringString", func(t *testing.T) {
+		m := map[string]string{"a": "b", "c": "d", "e": "f"}
+		got := MapToSlice(m)
+		assert.ElementsMatch(t, got, []string{"a", "c", "e"})
+	})
+	t.Run("mapStringStruct", func(t *testing.T) {
+		m := map[string]struct{}{"a": {}, "c": {}, "e": {}}
+		got := MapToSlice(m)
+		assert.ElementsMatch(t, got, []string{"a", "c", "e"})
+	})
+	t.Run("intStringStruct", func(t *testing.T) {
+		m := map[int]struct{}{1: {}, 2: {}, 3: {}}
+		got := MapToSlice(m)
+		assert.ElementsMatch(t, got, []int{1, 2, 3})
+	})
+}
+
+func TestGetNamespaceOrDefault(t *testing.T) {
+	t.Run("namespace is empty", func(t *testing.T) {
+		ns := GetNamespaceOrDefault("default")
+		assert.Equal(t, "default", ns)
+	})
+
+	t.Run("namespace is not empty", func(t *testing.T) {
+		t.Setenv("NAMESPACE", "testNs")
+		ns := GetNamespaceOrDefault("default")
+		assert.Equal(t, "testNs", ns)
+	})
+}
+
+func BenchmarkFilter(b *testing.B) {
+	vals := make([]int, 100)
+	for i := 0; i < len(vals); i++ {
+		vals[i] = i
+	}
+
+	filterFn := func(n int) bool {
+		return n < 50
+	}
+
+	for n := 0; n < b.N; n++ {
+		Filter(vals, filterFn)
+	}
+}
+
+func TestParseServiceAddr(t *testing.T) {
+	testCases := []struct {
+		addr string
+		out  []string
+	}{
+		{
+			addr: "localhost:1020",
+			out:  []string{"localhost:1020"},
+		},
+		{
+			addr: "placement1:50005,placement2:50005,placement3:50005",
+			out:  []string{"placement1:50005", "placement2:50005", "placement3:50005"},
+		},
+		{
+			addr: "placement1:50005, placement2:50005, placement3:50005",
+			out:  []string{"placement1:50005", "placement2:50005", "placement3:50005"},
+		},
+	}
+
+	for _, tc := range testCases {
+		t.Run(tc.addr, func(t *testing.T) {
+			assert.EqualValues(t, tc.out, ParseServiceAddr(tc.addr))
+		})
+	}
 }

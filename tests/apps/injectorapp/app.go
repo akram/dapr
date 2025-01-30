@@ -124,7 +124,7 @@ func commandHandler(w http.ResponseWriter, r *http.Request) {
 	testCommand := mux.Vars(r)["command"]
 
 	// Trigger the test
-	res := appResponse{Message: fmt.Sprintf("%s is not supported", testCommand)}
+	res := appResponse{Message: testCommand + " is not supported"}
 	statusCode := http.StatusBadRequest
 
 	startTime := epoch()
@@ -147,7 +147,7 @@ func epoch() int {
 }
 
 // appRouter initializes restful api router
-func appRouter() *mux.Router {
+func appRouter() http.Handler {
 	router := mux.NewRouter().StrictSlash(true)
 
 	// Log requests and their processing time
@@ -161,7 +161,7 @@ func appRouter() *mux.Router {
 	return router
 }
 
-func securedAppRouter() *mux.Router {
+func securedAppRouter() http.Handler {
 	router := mux.NewRouter().StrictSlash(true)
 
 	// Log requests and their processing time

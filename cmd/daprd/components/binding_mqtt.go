@@ -1,3 +1,5 @@
+//go:build allcomponents
+
 /*
 Copyright 2021 The Dapr Authors
 Licensed under the Apache License, Version 2.0 (the "License");
@@ -15,7 +17,7 @@ package components
 
 import (
 	"github.com/dapr/components-contrib/bindings"
-	"github.com/dapr/components-contrib/bindings/mqtt"
+	mqtt "github.com/dapr/components-contrib/bindings/mqtt3"
 	bindingsLoader "github.com/dapr/dapr/pkg/components/bindings"
 	"github.com/dapr/kit/logger"
 )
@@ -23,8 +25,8 @@ import (
 func init() {
 	bindingsLoader.DefaultRegistry.RegisterInputBinding(func(l logger.Logger) bindings.InputBinding {
 		return mqtt.NewMQTT(l)
-	}, "mqtt")
+	}, "mqtt3", "mqtt")
 	bindingsLoader.DefaultRegistry.RegisterOutputBinding(func(l logger.Logger) bindings.OutputBinding {
 		return mqtt.NewMQTT(l)
-	}, "mqtt")
+	}, "mqtt3", "mqtt")
 }

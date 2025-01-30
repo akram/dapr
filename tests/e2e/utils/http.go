@@ -19,11 +19,14 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"time"
 
 	"golang.org/x/net/http2"
+
+	"github.com/dapr/kit/utils"
 )
 
 const (
@@ -44,7 +47,7 @@ func InitHTTPClient(allowHTTP2 bool) {
 // This should not be used except in rare circumstances. Developers should use the shared httpClient instead to re-use sockets as much as possible.
 func NewHTTPClient(allowHTTP2 bool) *http.Client {
 	// HTTP/2 is allowed only if the DAPR_TESTS_HTTP2 env var is set
-	allowHTTP2 = allowHTTP2 && IsTruthy(os.Getenv("DAPR_TESTS_HTTP2"))
+	allowHTTP2 = allowHTTP2 && utils.IsTruthy(os.Getenv("DAPR_TESTS_HTTP2"))
 
 	if allowHTTP2 {
 		return &http.Client{
@@ -59,6 +62,10 @@ func NewHTTPClient(allowHTTP2 bool) *http.Client {
 					return net.Dial(network, addr)
 				},
 			},
+			// disable test app client auto redirect handle
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
 		}
 	}
 	return &http.Client{
@@ -66,6 +73,10 @@ func NewHTTPClient(allowHTTP2 bool) *http.Client {
 		Transport: &http.Transport{
 			MaxIdleConns:        2,
 			MaxIdleConnsPerHost: 1,
+		},
+		// disable test app client auto redirect handle
+		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			return http.ErrUseLastResponse
 		},
 	}
 }
@@ -93,13 +104,54 @@ func HTTPGetNTimes(url string, n int) ([]byte, error) {
 
 // HTTPGet is a helper to make GET request call to url.
 func HTTPGet(url string) ([]byte, error) {
+	body, _, _, err := HTTPGetWithStatusWithMetadata(url)
+	return body, err
+}
+
+// HTTPGetWithStatus is a helper to make GET request call to url.
+func HTTPGetWithStatus(url string) ([]byte, int, error) {
+	body, status, _, err := HTTPGetWithStatusWithMetadata(url)
+	return body, status, err
+}
+
+// HTTPGetWithStatusWithMetadata is a helper to make GET request call to url.
+func HTTPGetWithStatusWithMetadata(url string) ([]byte, int, http.Header, error) {
 	resp, err := HTTPGetRaw(url)
 	if err != nil {
-		return nil, err
+		return nil, 0, nil, err
 	}
 	defer resp.Body.Close()
 
-	return io.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, nil, err
+	}
+
+	return body, resp.StatusCode, resp.Header, nil
+}
+
+// HTTPGetWithStatusWithData is a helper to make GET request call to url.
+func HTTPGetWithStatusWithData(surl string, data []byte) ([]byte, int, error) {
+	url, err := url.Parse(SanitizeHTTPURL(surl))
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := httpClient.Do(&http.Request{
+		Method: http.MethodGet,
+		URL:    url,
+		Body:   io.NopCloser(bytes.NewReader(data)),
+	})
+	if err != nil {
+		return nil, 0, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return body, resp.StatusCode, nil
 }
 
 // HTTPGetRawNTimes calls the url n times and returns the first
@@ -131,6 +183,17 @@ func HTTPGetRawNTimes(url string, n int) (*http.Response, error) {
 // HTTPGetRaw is a helper to make GET request call to url.
 func HTTPGetRaw(url string) (*http.Response, error) {
 	return httpClient.Get(SanitizeHTTPURL(url))
+}
+
+func HTTPGetRawWithHeaders(url string, header http.Header) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, SanitizeHTTPURL(url), nil)
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header = header
+
+	return httpClient.Do(req)
 }
 
 // HTTPPost is a helper to make POST request call to url.
@@ -197,6 +260,27 @@ func HTTPDelete(url string) ([]byte, error) {
 	return io.ReadAll(res.Body)
 }
 
+// HTTPDeleteWithStatus calls a given URL with the HTTP DELETE method.
+func HTTPDeleteWithStatus(url string) ([]byte, int, error) {
+	req, err := http.NewRequest(http.MethodDelete, SanitizeHTTPURL(url), nil)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	res, err := httpClient.Do(req)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer res.Body.Close()
+
+	body, err := io.ReadAll(res.Body)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return body, res.StatusCode, nil
+}
+
 // SanitizeHTTPURL prepends the prefix "http://" to a URL if not present
 func SanitizeHTTPURL(url string) string {
 	if !strings.HasPrefix(url, "http") {
@@ -204,4 +288,9 @@ func SanitizeHTTPURL(url string) string {
 	}
 
 	return url
+}
+
+// GetHTTPClient returns the shared httpClient object.
+func GetHTTPClient() *http.Client {
+	return httpClient
 }

@@ -1,5 +1,5 @@
 /*
-Copyright 2021 The Dapr Authors
+Copyright 2023 The Dapr Authors
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
 You may obtain a copy of the License at
@@ -16,24 +16,26 @@ package diagnostics
 import (
 	"context"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
-
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/metadata"
-
+	"github.com/stretchr/testify/require"
 	"go.opentelemetry.io/otel"
 	otelcodes "go.opentelemetry.io/otel/codes"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	grpcMetadata "google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
+	"github.com/dapr/dapr/pkg/api/grpc/metadata"
 	"github.com/dapr/dapr/pkg/config"
+	diagConsts "github.com/dapr/dapr/pkg/diagnostics/consts"
 	diagUtils "github.com/dapr/dapr/pkg/diagnostics/utils"
 	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
 	internalv1pb "github.com/dapr/dapr/pkg/proto/internals/v1"
@@ -43,65 +45,45 @@ import (
 func TestSpanAttributesMapFromGRPC(t *testing.T) {
 	tests := []struct {
 		rpcMethod                    string
-		requestType                  string
+		req                          any
 		expectedServiceNameAttribute string
 		expectedCustomAttribute      string
 	}{
-		{"/dapr.proto.internals.v1.ServiceInvocation/CallLocal", "InternalInvokeRequest", "ServiceInvocation", "mymethod"},
-		// InvokeService will be ServiceInvocation because this call will be treated as client call
-		// of service invocation.
-		{"/dapr.proto.runtime.v1.Dapr/InvokeService", "InvokeServiceRequest", "ServiceInvocation", "mymethod"},
-		{"/dapr.proto.runtime.v1.Dapr/GetState", "GetStateRequest", "Dapr", "mystore"},
-		{"/dapr.proto.runtime.v1.Dapr/SaveState", "SaveStateRequest", "Dapr", "mystore"},
-		{"/dapr.proto.runtime.v1.Dapr/DeleteState", "DeleteStateRequest", "Dapr", "mystore"},
-		{"/dapr.proto.runtime.v1.Dapr/GetSecret", "GetSecretRequest", "Dapr", "mysecretstore"},
-		{"/dapr.proto.runtime.v1.Dapr/InvokeBinding", "InvokeBindingRequest", "Dapr", "mybindings"},
-		{"/dapr.proto.runtime.v1.Dapr/PublishEvent", "PublishEventRequest", "Dapr", "mytopic"},
+		{"/dapr.proto.runtime.v1.Dapr/InvokeService", &runtimev1pb.InvokeServiceRequest{Message: &commonv1pb.InvokeRequest{Method: "mymethod"}}, "ServiceInvocation", "mymethod"},
+		{"/dapr.proto.runtime.v1.Dapr/GetState", &runtimev1pb.GetStateRequest{StoreName: "mystore"}, "Dapr", "mystore"},
+		{"/dapr.proto.runtime.v1.Dapr/SaveState", &runtimev1pb.SaveStateRequest{StoreName: "mystore"}, "Dapr", "mystore"},
+		{"/dapr.proto.runtime.v1.Dapr/DeleteState", &runtimev1pb.DeleteStateRequest{StoreName: "mystore"}, "Dapr", "mystore"},
+		{"/dapr.proto.runtime.v1.Dapr/GetSecret", &runtimev1pb.GetSecretRequest{StoreName: "mysecretstore"}, "Dapr", "mysecretstore"},
+		{"/dapr.proto.runtime.v1.Dapr/InvokeBinding", &runtimev1pb.InvokeBindingRequest{Name: "mybindings"}, "Dapr", "mybindings"},
+		{"/dapr.proto.runtime.v1.Dapr/PublishEvent", &runtimev1pb.PublishEventRequest{Topic: "mytopic"}, "Dapr", "mytopic"},
+		{"/dapr.proto.runtime.v1.Dapr/BulkPublishEventAlpha1", &runtimev1pb.BulkPublishRequest{Topic: "mytopic"}, "Dapr", "mytopic"},
+		// Expecting ServiceInvocation because this call will be treated as client call of service invocation.
+		{"/dapr.proto.internals.v1.ServiceInvocation/CallLocal", &internalv1pb.InternalInvokeRequest{Message: &commonv1pb.InvokeRequest{Method: "mymethod"}}, "ServiceInvocation", "mymethod"},
 	}
-	var req interface{}
 	for _, tt := range tests {
 		t.Run(tt.rpcMethod, func(t *testing.T) {
-			switch tt.requestType {
-			case "InvokeServiceRequest":
-				req = &runtimev1pb.InvokeServiceRequest{Message: &commonv1pb.InvokeRequest{Method: "mymethod"}}
-			case "GetStateRequest":
-				req = &runtimev1pb.GetStateRequest{StoreName: "mystore"}
-			case "SaveStateRequest":
-				req = &runtimev1pb.SaveStateRequest{StoreName: "mystore"}
-			case "DeleteStateRequest":
-				req = &runtimev1pb.DeleteStateRequest{StoreName: "mystore"}
-			case "GetSecretRequest":
-				req = &runtimev1pb.GetSecretRequest{StoreName: "mysecretstore"}
-			case "InvokeBindingRequest":
-				req = &runtimev1pb.InvokeBindingRequest{Name: "mybindings"}
-			case "PublishEventRequest":
-				req = &runtimev1pb.PublishEventRequest{Topic: "mytopic"}
-			case "TopicEventRequest":
-				req = &runtimev1pb.TopicEventRequest{Topic: "mytopic"}
-			case "BindingEventRequest":
-				req = &runtimev1pb.BindingEventRequest{Name: "mybindings"}
-			case "InternalInvokeRequest":
-				req = &internalv1pb.InternalInvokeRequest{Message: &commonv1pb.InvokeRequest{Method: "mymethod"}}
-			}
-
-			got := spanAttributesMapFromGRPC("fakeAppID", req, tt.rpcMethod)
-			assert.Equal(t, tt.expectedServiceNameAttribute, got[gRPCServiceSpanAttributeKey], "servicename attribute should be equal")
+			got := spanAttributesMapFromGRPC("fakeAppID", tt.req, tt.rpcMethod)
+			assert.Equal(t, tt.expectedServiceNameAttribute, got[diagConsts.GrpcServiceSpanAttributeKey], "servicename attribute should be equal")
 		})
 	}
 }
 
 func TestUserDefinedMetadata(t *testing.T) {
-	md := metadata.MD{
+	md := grpcMetadata.MD{
 		"dapr-userdefined-1": []string{"value1"},
-		"dapr-userdefined-2": []string{"value2", "value3"},
+		"DAPR-userdefined-2": []string{"value2", "value3"}, // Will be lowercased
 		"no-attr":            []string{"value3"},
 	}
 
-	testCtx := metadata.NewIncomingContext(context.Background(), md)
+	testCtx := grpcMetadata.NewIncomingContext(context.Background(), md)
+	metadata.SetMetadataInContextUnary(testCtx, nil, nil, func(ctx context.Context, req any) (any, error) {
+		testCtx = ctx
+		return nil, nil
+	})
 
 	m := userDefinedMetadata(testCtx)
 
-	assert.Equal(t, 2, len(m))
+	assert.Len(t, m, 2)
 	assert.Equal(t, "value1", m["dapr-userdefined-1"])
 	assert.Equal(t, "value2", m["dapr-userdefined-2"])
 }
@@ -116,8 +98,6 @@ func TestSpanContextToGRPCMetadata(t *testing.T) {
 }
 
 func TestGRPCTraceUnaryServerInterceptor(t *testing.T) {
-	rate := config.TracingSpec{SamplingRate: "1"}
-
 	exp := newOtelFakeExporter()
 
 	tp := sdktrace.NewTracerProvider(
@@ -126,15 +106,14 @@ func TestGRPCTraceUnaryServerInterceptor(t *testing.T) {
 	defer func() { _ = tp.Shutdown(context.Background()) }()
 	otel.SetTracerProvider(tp)
 
-	interceptor := GRPCTraceUnaryServerInterceptor("fakeAppID", rate)
+	interceptor := GRPCTraceUnaryServerInterceptor("fakeAppID", config.TracingSpec{SamplingRate: "1"})
 
 	testTraceParent := "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
 	testSpanContext, _ := SpanContextFromW3CString(testTraceParent)
 	testTraceBinary := diagUtils.BinaryFromSpanContext(testSpanContext)
-	ctx := context.Background()
 
 	t.Run("grpc-trace-bin is given", func(t *testing.T) {
-		ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("grpc-trace-bin", string(testTraceBinary)))
+		ctx := grpcMetadata.NewIncomingContext(context.Background(), grpcMetadata.Pairs("grpc-trace-bin", string(testTraceBinary)))
 		fakeInfo := &grpc.UnaryServerInfo{
 			FullMethod: "/dapr.proto.runtime.v1.Dapr/GetState",
 		}
@@ -144,18 +123,20 @@ func TestGRPCTraceUnaryServerInterceptor(t *testing.T) {
 		}
 
 		var span trace.Span
-		assertHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		assertHandler := func(ctx context.Context, req any) (any, error) {
 			span = diagUtils.SpanFromContext(ctx)
 			return nil, errors.New("fake error")
 		}
 
-		interceptor(ctx, fakeReq, fakeInfo, assertHandler)
+		metadata.SetMetadataInContextUnary(ctx, fakeReq, fakeInfo, func(ctx context.Context, req any) (any, error) {
+			return interceptor(ctx, fakeReq, fakeInfo, assertHandler)
+		})
 
 		sc := span.SpanContext()
 		traceID := sc.TraceID()
-		assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", fmt.Sprintf("%x", traceID[:]))
+		assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", hex.EncodeToString(traceID[:]))
 		spanID := sc.SpanID()
-		assert.NotEqual(t, "00f067aa0ba902b7", fmt.Sprintf("%x", spanID[:]))
+		assert.NotEqual(t, "00f067aa0ba902b7", hex.EncodeToString(spanID[:]))
 	})
 
 	t.Run("grpc-trace-bin is not given", func(t *testing.T) {
@@ -168,18 +149,18 @@ func TestGRPCTraceUnaryServerInterceptor(t *testing.T) {
 		}
 
 		var span trace.Span
-		assertHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		assertHandler := func(ctx context.Context, req any) (any, error) {
 			span = diagUtils.SpanFromContext(ctx)
 			return nil, errors.New("fake error")
 		}
 
-		interceptor(ctx, fakeReq, fakeInfo, assertHandler)
+		interceptor(context.Background(), fakeReq, fakeInfo, assertHandler)
 
 		sc := span.SpanContext()
 		traceID := sc.TraceID()
 		spanID := sc.SpanID()
-		assert.NotEmpty(t, fmt.Sprintf("%x", traceID[:]))
-		assert.NotEmpty(t, fmt.Sprintf("%x", spanID[:]))
+		assert.NotEmpty(t, hex.EncodeToString(traceID[:]))
+		assert.NotEmpty(t, hex.EncodeToString(spanID[:]))
 	})
 
 	t.Run("InvokeService call", func(t *testing.T) {
@@ -192,20 +173,20 @@ func TestGRPCTraceUnaryServerInterceptor(t *testing.T) {
 		}
 
 		var span trace.Span
-		assertHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		assertHandler := func(ctx context.Context, req any) (any, error) {
 			span = diagUtils.SpanFromContext(ctx)
 			return nil, errors.New("fake error")
 		}
 
-		interceptor(ctx, fakeReq, fakeInfo, assertHandler)
+		interceptor(context.Background(), fakeReq, fakeInfo, assertHandler)
 
 		sc := span.SpanContext()
 		spanString := fmt.Sprintf("%v", span)
 		assert.True(t, strings.Contains(spanString, "CallLocal/targetID/method1"))
 		traceID := sc.TraceID()
 		spanID := sc.SpanID()
-		assert.NotEmpty(t, fmt.Sprintf("%x", traceID[:]))
-		assert.NotEmpty(t, fmt.Sprintf("%x", spanID[:]))
+		assert.NotEmpty(t, hex.EncodeToString(traceID[:]))
+		assert.NotEmpty(t, hex.EncodeToString(spanID[:]))
 	})
 
 	t.Run("InvokeService call with grpc status error", func(t *testing.T) {
@@ -235,74 +216,249 @@ func TestGRPCTraceUnaryServerInterceptor(t *testing.T) {
 		}
 
 		var span trace.Span
-		assertHandler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		assertHandler := func(ctx context.Context, req any) (any, error) {
 			span = diagUtils.SpanFromContext(ctx)
 			// mocking an error that is returned from the gRPC API -- see pkg/grpc/api.go file
 			return nil, status.Error(codes.Internal, errors.New("fake status error").Error())
 		}
 
-		interceptor(ctx, fakeReq, fakeInfo, assertHandler)
+		interceptor(context.Background(), fakeReq, fakeInfo, assertHandler)
 
 		sc := span.SpanContext()
 		spanString := fmt.Sprintf("%v", span)
 		assert.True(t, strings.Contains(spanString, "CallLocal/targetID/method1"))
 		traceID := sc.TraceID()
 		spanID := sc.SpanID()
-		assert.NotEmpty(t, fmt.Sprintf("%x", traceID[:]))
-		assert.NotEmpty(t, fmt.Sprintf("%x", spanID[:]))
+		assert.NotEmpty(t, hex.EncodeToString(traceID[:]))
+		assert.NotEmpty(t, hex.EncodeToString(spanID[:]))
 	})
 }
 
 func TestGRPCTraceStreamServerInterceptor(t *testing.T) {
-	interceptor := GRPCTraceStreamServerInterceptor("test", config.TracingSpec{})
+	exp := newOtelFakeExporter()
 
-	t.Run("invalid proxy request, return nil", func(t *testing.T) {
-		ctx := context.TODO()
-		fakeInfo := &grpc.StreamServerInfo{
-			FullMethod: "/dapr.proto.runtime.v1.Dapr/GetState",
-		}
+	tp := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exp),
+	)
+	defer func() { _ = tp.Shutdown(context.Background()) }()
+	otel.SetTracerProvider(tp)
 
-		h := func(srv interface{}, stream grpc.ServerStream) error {
-			return nil
-		}
+	interceptor := GRPCTraceStreamServerInterceptor("test", config.TracingSpec{SamplingRate: "1"})
 
-		err := interceptor(ctx, nil, fakeInfo, h)
-		assert.Nil(t, err)
+	testTraceParent := "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	testSpanContext, _ := SpanContextFromW3CString(testTraceParent)
+	testTraceBinary := diagUtils.BinaryFromSpanContext(testSpanContext)
+
+	t.Run("dapr runtime calls", func(t *testing.T) {
+		t.Run("base test", func(t *testing.T) {
+			fakeInfo := &grpc.StreamServerInfo{
+				FullMethod: "/dapr.proto.runtime.v1.Dapr/GetState",
+			}
+
+			h := func(srv any, stream grpc.ServerStream) error {
+				return nil
+			}
+
+			err := interceptor(nil, &fakeStream{}, fakeInfo, h)
+			require.NoError(t, err)
+		})
+
+		t.Run("grpc-trace-bin is given", func(t *testing.T) {
+			fakeInfo := &grpc.StreamServerInfo{
+				FullMethod: "/dapr.proto.runtime.v1.Dapr/GetState",
+			}
+
+			ctx := grpcMetadata.NewIncomingContext(context.Background(), grpcMetadata.Pairs("grpc-trace-bin", string(testTraceBinary)))
+			ctx, _ = metadata.SetMetadataInTapHandle(ctx, nil)
+
+			var span trace.Span
+			assertHandler := func(srv any, stream grpc.ServerStream) error {
+				span = diagUtils.SpanFromContext(stream.Context())
+				return errors.New("fake error")
+			}
+
+			interceptor(nil, &fakeStream{ctx}, fakeInfo, assertHandler)
+
+			sc := span.SpanContext()
+			traceID := sc.TraceID()
+			assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", hex.EncodeToString(traceID[:]))
+			spanID := sc.SpanID()
+			assert.NotEqual(t, "00f067aa0ba902b7", hex.EncodeToString(spanID[:]))
+		})
+
+		t.Run("grpc-trace-bin is not given", func(t *testing.T) {
+			fakeInfo := &grpc.StreamServerInfo{
+				FullMethod: "/dapr.proto.runtime.v1.Dapr/GetState",
+			}
+
+			var span trace.Span
+			assertHandler := func(srv any, stream grpc.ServerStream) error {
+				span = diagUtils.SpanFromContext(stream.Context())
+				return errors.New("fake error")
+			}
+
+			interceptor(nil, &fakeStream{}, fakeInfo, assertHandler)
+
+			sc := span.SpanContext()
+			traceID := sc.TraceID()
+			spanID := sc.SpanID()
+			assert.NotEmpty(t, hex.EncodeToString(traceID[:]))
+			assert.NotEmpty(t, hex.EncodeToString(spanID[:]))
+		})
 	})
 
-	t.Run("valid proxy request without app id, return error", func(t *testing.T) {
-		ctx := context.TODO()
-		fakeInfo := &grpc.StreamServerInfo{
-			FullMethod: "/myapp.v1.DoSomething",
-		}
+	t.Run("internal calls", func(t *testing.T) {
+		t.Run("base test", func(t *testing.T) {
+			fakeInfo := &grpc.StreamServerInfo{
+				FullMethod: "/dapr.proto.internals.v1.ServiceInvocation/CallLocal",
+			}
 
-		err := interceptor(ctx, &fakeStream{}, fakeInfo, nil)
-		assert.Error(t, err)
+			h := func(srv any, stream grpc.ServerStream) error {
+				return nil
+			}
+
+			err := interceptor(nil, &fakeStream{}, fakeInfo, h)
+			require.NoError(t, err)
+		})
+
+		t.Run("grpc-trace-bin is given", func(t *testing.T) {
+			fakeInfo := &grpc.StreamServerInfo{
+				FullMethod: "/dapr.proto.internals.v1.ServiceInvocation/CallLocal",
+			}
+
+			ctx := grpcMetadata.NewIncomingContext(context.Background(), grpcMetadata.Pairs("grpc-trace-bin", string(testTraceBinary)))
+			ctx, _ = metadata.SetMetadataInTapHandle(ctx, nil)
+
+			var span trace.Span
+			assertHandler := func(srv any, stream grpc.ServerStream) error {
+				span = diagUtils.SpanFromContext(stream.Context())
+				return errors.New("fake error")
+			}
+
+			interceptor(nil, &fakeStream{ctx}, fakeInfo, assertHandler)
+
+			sc := span.SpanContext()
+			traceID := sc.TraceID()
+			assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", hex.EncodeToString(traceID[:]))
+			spanID := sc.SpanID()
+			assert.NotEqual(t, "00f067aa0ba902b7", hex.EncodeToString(spanID[:]))
+		})
+
+		t.Run("grpc-trace-bin is not given", func(t *testing.T) {
+			fakeInfo := &grpc.StreamServerInfo{
+				FullMethod: "/dapr.proto.internals.v1.ServiceInvocation/CallLocal",
+			}
+
+			var span trace.Span
+			assertHandler := func(srv any, stream grpc.ServerStream) error {
+				span = diagUtils.SpanFromContext(stream.Context())
+				return errors.New("fake error")
+			}
+
+			interceptor(nil, &fakeStream{}, fakeInfo, assertHandler)
+
+			sc := span.SpanContext()
+			traceID := sc.TraceID()
+			spanID := sc.SpanID()
+			assert.NotEmpty(t, hex.EncodeToString(traceID[:]))
+			assert.NotEmpty(t, hex.EncodeToString(spanID[:]))
+		})
+	})
+
+	t.Run("proxy requests", func(t *testing.T) {
+		t.Run("proxy request without app id, return error", func(t *testing.T) {
+			fakeInfo := &grpc.StreamServerInfo{
+				FullMethod: "/myapp.v1.DoSomething",
+			}
+
+			err := interceptor(nil, &fakeStream{}, fakeInfo, nil)
+			require.Error(t, err)
+		})
+
+		t.Run("proxy request with app id and grpc-trace-bin", func(t *testing.T) {
+			fakeInfo := &grpc.StreamServerInfo{
+				FullMethod: "/myapp.v1.DoSomething",
+			}
+
+			md := grpcMetadata.New(map[string]string{
+				GRPCProxyAppIDKey: "myapp",
+				"grpc-trace-bin":  string(testTraceBinary),
+			})
+			ctx := grpcMetadata.NewIncomingContext(context.Background(), md)
+			ctx, _ = metadata.SetMetadataInTapHandle(ctx, nil)
+
+			var span trace.Span
+			assertHandler := func(srv any, stream grpc.ServerStream) error {
+				span = diagUtils.SpanFromContext(stream.Context())
+				return nil
+			}
+
+			err := interceptor(nil, &fakeStream{ctx}, fakeInfo, assertHandler)
+			require.NoError(t, err)
+
+			sc := span.SpanContext()
+			traceID := sc.TraceID()
+			assert.Equal(t, "4bf92f3577b34da6a3ce929d0e0e4736", hex.EncodeToString(traceID[:]))
+			spanID := sc.SpanID()
+			assert.NotEqual(t, "00f067aa0ba902b7", hex.EncodeToString(spanID[:]))
+		})
+
+		t.Run("proxy request with app id and no grpc-trace-bin", func(t *testing.T) {
+			fakeInfo := &grpc.StreamServerInfo{
+				FullMethod: "/myapp.v1.DoSomething",
+			}
+
+			md := grpcMetadata.New(map[string]string{
+				GRPCProxyAppIDKey: "myapp",
+			})
+			ctx := grpcMetadata.NewIncomingContext(context.Background(), md)
+			ctx, _ = metadata.SetMetadataInTapHandle(ctx, nil)
+
+			var span trace.Span
+			assertHandler := func(srv any, stream grpc.ServerStream) error {
+				span = diagUtils.SpanFromContext(stream.Context())
+				return nil
+			}
+
+			err := interceptor(nil, &fakeStream{ctx}, fakeInfo, assertHandler)
+			require.NoError(t, err)
+
+			sc := span.SpanContext()
+			traceID := sc.TraceID()
+			spanID := sc.SpanID()
+			assert.NotEmpty(t, hex.EncodeToString(traceID[:]))
+			assert.NotEmpty(t, hex.EncodeToString(spanID[:]))
+		})
 	})
 }
 
-type fakeStream struct{}
+type fakeStream struct {
+	ctx context.Context
+}
 
 func (f *fakeStream) Context() context.Context {
-	return context.TODO()
+	if f.ctx == nil {
+		return context.Background()
+	}
+	return f.ctx
 }
 
-func (f *fakeStream) SetHeader(metadata.MD) error {
+func (f *fakeStream) SetHeader(grpcMetadata.MD) error {
 	return nil
 }
 
-func (f *fakeStream) SendHeader(metadata.MD) error {
+func (f *fakeStream) SendHeader(grpcMetadata.MD) error {
 	return nil
 }
 
-func (f *fakeStream) SetTrailer(metadata.MD) {
+func (f *fakeStream) SetTrailer(grpcMetadata.MD) {
 }
 
-func (f *fakeStream) SendMsg(m interface{}) error {
+func (f *fakeStream) SendMsg(m any) error {
 	return nil
 }
 
-func (f *fakeStream) RecvMsg(m interface{}) error {
+func (f *fakeStream) RecvMsg(m any) error {
 	return nil
 }
 

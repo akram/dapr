@@ -32,4 +32,11 @@ spec:
     value: dapre2e
   - name: collection
     value: items
-
+scopes:
+  - stateapp
+  - stateapp-pluggable
+  - httpmetrics
+  - grpcmetrics
+  - disabledmetric
+  - perf-workflowsapp
+  - perf-workflowsapp-actors

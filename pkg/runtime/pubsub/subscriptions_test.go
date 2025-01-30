@@ -4,26 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
-	"os"
-	"path/filepath"
 	"testing"
 
-	"github.com/ghodss/yaml"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/emptypb"
-	v1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
-	subscriptionsapiV1alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v1alpha1"
 	subscriptionsapiV2alpha1 "github.com/dapr/dapr/pkg/apis/subscriptions/v2alpha1"
 	"github.com/dapr/dapr/pkg/channel"
 	invokev1 "github.com/dapr/dapr/pkg/messaging/v1"
-	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
-	operatorv1pb "github.com/dapr/dapr/pkg/proto/operator/v1"
 	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
 	"github.com/dapr/dapr/pkg/resiliency"
 	"github.com/dapr/kit/logger"
@@ -64,205 +56,6 @@ func TestFilterSubscriptions(t *testing.T) {
 	}
 }
 
-func testDeclarativeSubscriptionV1() subscriptionsapiV1alpha1.Subscription {
-	return subscriptionsapiV1alpha1.Subscription{
-		TypeMeta: v1.TypeMeta{
-			Kind:       "Subscription",
-			APIVersion: APIVersionV1alpha1,
-		},
-		Spec: subscriptionsapiV1alpha1.SubscriptionSpec{
-			Pubsubname: "pubsub",
-			Topic:      "topic1",
-			Metadata: map[string]string{
-				"testName": "testValue",
-			},
-			Route: "myroute",
-		},
-	}
-}
-
-func testDeclarativeSubscriptionV2() subscriptionsapiV2alpha1.Subscription {
-	return subscriptionsapiV2alpha1.Subscription{
-		TypeMeta: v1.TypeMeta{
-			Kind:       "Subscription",
-			APIVersion: APIVersionV2alpha1,
-		},
-		Spec: subscriptionsapiV2alpha1.SubscriptionSpec{
-			Pubsubname: "pubsub",
-			Topic:      "topic1",
-			Metadata: map[string]string{
-				"testName": "testValue",
-			},
-			Routes: subscriptionsapiV2alpha1.Routes{
-				Rules: []subscriptionsapiV2alpha1.Rule{
-					{
-						Match: `event.type == "myevent.v3"`,
-						Path:  "myroute.v3",
-					},
-					{
-						Match: `event.type == "myevent.v2"`,
-						Path:  "myroute.v2",
-					},
-				},
-				Default: "myroute",
-			},
-		},
-	}
-}
-
-func writeSubscriptionToDisk(subscription interface{}, filePath string) {
-	b, _ := yaml.Marshal(subscription)
-	os.WriteFile(filePath, b, 0o600)
-}
-
-func TestDeclarativeSubscriptionsV1(t *testing.T) {
-	dir := filepath.Join(".", "components")
-	os.Mkdir(dir, 0o777)
-	defer os.RemoveAll(dir)
-
-	t.Run("load single valid subscription", func(t *testing.T) {
-		s := testDeclarativeSubscriptionV1()
-		s.Scopes = []string{"scope1"}
-
-		filePath := filepath.Join(dir, "sub.yaml")
-		writeSubscriptionToDisk(s, filePath)
-
-		subs := DeclarativeSelfHosted(dir, log)
-		if assert.Len(t, subs, 1) {
-			assert.Equal(t, "topic1", subs[0].Topic)
-			if assert.Len(t, subs[0].Rules, 1) {
-				assert.Equal(t, "myroute", subs[0].Rules[0].Path)
-			}
-			assert.Equal(t, "pubsub", subs[0].PubsubName)
-			assert.Equal(t, "scope1", subs[0].Scopes[0])
-			assert.Equal(t, "testValue", subs[0].Metadata["testName"])
-		}
-	})
-
-	t.Run("load multiple subscriptions", func(t *testing.T) {
-		for i := 0; i < 1; i++ {
-			s := testDeclarativeSubscriptionV1()
-			s.Spec.Topic = fmt.Sprintf("%v", i)
-			s.Spec.Route = fmt.Sprintf("%v", i)
-			s.Spec.Pubsubname = fmt.Sprintf("%v", i)
-			s.Spec.Metadata = map[string]string{
-				"testName": fmt.Sprintf("%v", i),
-			}
-			s.Scopes = []string{fmt.Sprintf("%v", i)}
-
-			writeSubscriptionToDisk(s, fmt.Sprintf("%s/%v.yaml", dir, i))
-		}
-
-		subs := DeclarativeSelfHosted(dir, log)
-		if assert.Len(t, subs, 2) {
-			for i := 0; i < 1; i++ {
-				assert.Equal(t, fmt.Sprintf("%v", i), subs[i].Topic)
-				if assert.Equal(t, 1, len(subs[i].Rules)) {
-					assert.Equal(t, fmt.Sprintf("%v", i), subs[i].Rules[0].Path)
-				}
-				assert.Equal(t, fmt.Sprintf("%v", i), subs[i].PubsubName)
-				assert.Equal(t, fmt.Sprintf("%v", i), subs[i].Scopes[0])
-				assert.Equal(t, fmt.Sprintf("%v", i), subs[i].Metadata["testName"])
-			}
-		}
-	})
-
-	t.Run("will not load non yaml file", func(t *testing.T) {
-		s := testDeclarativeSubscriptionV1()
-		s.Scopes = []string{"scope1"}
-
-		filePath := filepath.Join(dir, "sub.txt")
-		writeSubscriptionToDisk(s, filePath)
-
-		subs := DeclarativeSelfHosted(dir, log)
-		assert.Len(t, subs, 2)
-	})
-
-	t.Run("no subscriptions loaded", func(t *testing.T) {
-		os.RemoveAll(dir)
-
-		s := testDeclarativeSubscriptionV1()
-		s.Scopes = []string{"scope1"}
-
-		writeSubscriptionToDisk(s, dir)
-
-		subs := DeclarativeSelfHosted(dir, log)
-		assert.Len(t, subs, 0)
-	})
-}
-
-func TestDeclarativeSubscriptionsV2(t *testing.T) {
-	dir := filepath.Join(".", "componentsV2")
-	os.Mkdir(dir, 0o777)
-	defer os.RemoveAll(dir)
-
-	t.Run("load single valid subscription", func(t *testing.T) {
-		s := testDeclarativeSubscriptionV2()
-		s.Scopes = []string{"scope1"}
-
-		filePath := filepath.Join(dir, "sub.yaml")
-		writeSubscriptionToDisk(s, filePath)
-
-		subs := DeclarativeSelfHosted(dir, log)
-		if assert.Len(t, subs, 1) {
-			assert.Equal(t, "topic1", subs[0].Topic)
-			if assert.Len(t, subs[0].Rules, 3) {
-				assert.Equal(t, "myroute.v3", subs[0].Rules[0].Path)
-				assert.Equal(t, "myroute.v2", subs[0].Rules[1].Path)
-				assert.Equal(t, "myroute", subs[0].Rules[2].Path)
-			}
-			assert.Equal(t, "pubsub", subs[0].PubsubName)
-			assert.Equal(t, "scope1", subs[0].Scopes[0])
-			assert.Equal(t, "testValue", subs[0].Metadata["testName"])
-		}
-	})
-
-	t.Run("load multiple subscriptions", func(t *testing.T) {
-		for i := 0; i < 1; i++ {
-			iStr := fmt.Sprintf("%v", i)
-			s := testDeclarativeSubscriptionV2()
-			s.Spec.Topic = iStr
-			for j := range s.Spec.Routes.Rules {
-				s.Spec.Routes.Rules[j].Path = iStr
-			}
-			s.Spec.Routes.Default = iStr
-			s.Spec.Pubsubname = iStr
-			s.Spec.Metadata = map[string]string{
-				"testName": iStr,
-			}
-			s.Scopes = []string{iStr}
-
-			writeSubscriptionToDisk(s, fmt.Sprintf("%s/%v.yaml", dir, i))
-		}
-
-		subs := DeclarativeSelfHosted(dir, log)
-		if assert.Len(t, subs, 2) {
-			for i := 0; i < 1; i++ {
-				iStr := fmt.Sprintf("%v", i)
-				assert.Equal(t, iStr, subs[i].Topic)
-				if assert.Equal(t, 3, len(subs[i].Rules)) {
-					assert.Equal(t, iStr, subs[i].Rules[0].Path)
-				}
-				assert.Equal(t, iStr, subs[i].PubsubName)
-				assert.Equal(t, iStr, subs[i].Scopes[0])
-				assert.Equal(t, iStr, subs[i].Metadata["testName"])
-			}
-		}
-	})
-
-	t.Run("no subscriptions loaded", func(t *testing.T) {
-		os.RemoveAll(dir)
-
-		s := testDeclarativeSubscriptionV2()
-		s.Scopes = []string{"scope1"}
-
-		writeSubscriptionToDisk(s, dir)
-
-		subs := DeclarativeSelfHosted(dir, log)
-		assert.Len(t, subs, 0)
-	})
-}
-
 type mockUnstableHTTPSubscriptions struct {
 	channel.AppChannel
 	callCount        int
@@ -270,7 +63,7 @@ type mockUnstableHTTPSubscriptions struct {
 	successThreshold int
 }
 
-func (m *mockUnstableHTTPSubscriptions) InvokeMethod(ctx context.Context, req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, error) {
+func (m *mockUnstableHTTPSubscriptions) InvokeMethod(ctx context.Context, req *invokev1.InvokeMethodRequest, appID string) (*invokev1.InvokeMethodResponse, error) {
 	if m.alwaysError {
 		return nil, errors.New("error")
 	}
@@ -306,8 +99,9 @@ func (m *mockUnstableHTTPSubscriptions) InvokeMethod(ctx context.Context, req *i
 
 	responseBytes, _ := json.Marshal(subs)
 
-	response := invokev1.NewInvokeMethodResponse(200, "OK", nil)
-	response.WithRawData(responseBytes, "content/json")
+	response := invokev1.NewInvokeMethodResponse(200, "OK", nil).
+		WithRawDataBytes(responseBytes).
+		WithContentType("application/json")
 	return response, nil
 }
 
@@ -315,7 +109,7 @@ type mockHTTPSubscriptions struct {
 	channel.AppChannel
 }
 
-func (m *mockHTTPSubscriptions) InvokeMethod(ctx context.Context, req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, error) {
+func (m *mockHTTPSubscriptions) InvokeMethod(ctx context.Context, req *invokev1.InvokeMethodRequest, appID string) (*invokev1.InvokeMethodResponse, error) {
 	subs := []SubscriptionJSON{
 		{
 			PubsubName: "pubsub",
@@ -341,15 +135,16 @@ func (m *mockHTTPSubscriptions) InvokeMethod(ctx context.Context, req *invokev1.
 
 	responseBytes, _ := json.Marshal(subs)
 
-	response := invokev1.NewInvokeMethodResponse(200, "OK", nil)
-	response.WithRawData(responseBytes, "content/json")
+	response := invokev1.NewInvokeMethodResponse(200, "OK", nil).
+		WithRawDataBytes(responseBytes).
+		WithContentType("application/json")
 	return response, nil
 }
 
 func TestHTTPSubscriptions(t *testing.T) {
 	t.Run("topics received, no errors", func(t *testing.T) {
 		m := mockHTTPSubscriptions{}
-		subs, err := GetSubscriptionsHTTP(&m, log, resiliency.FromConfigurations(log), false)
+		subs, err := GetSubscriptionsHTTP(context.TODO(), &m, log, resiliency.FromConfigurations(log))
 		require.NoError(t, err)
 		if assert.Len(t, subs, 1) {
 			assert.Equal(t, "topic1", subs[0].Topic)
@@ -368,7 +163,7 @@ func TestHTTPSubscriptions(t *testing.T) {
 			successThreshold: 3,
 		}
 
-		subs, err := GetSubscriptionsHTTP(&m, log, resiliency.FromConfigurations(log), false)
+		subs, err := GetSubscriptionsHTTP(context.TODO(), &m, log, resiliency.FromConfigurations(log))
 		assert.Equal(t, m.successThreshold, m.callCount)
 		require.NoError(t, err)
 		if assert.Len(t, subs, 1) {
@@ -388,7 +183,7 @@ func TestHTTPSubscriptions(t *testing.T) {
 			alwaysError: true,
 		}
 
-		_, err := GetSubscriptionsHTTP(&m, log, resiliency.FromConfigurations(log), false)
+		_, err := GetSubscriptionsHTTP(context.TODO(), &m, log, resiliency.FromConfigurations(log))
 		require.Error(t, err)
 	})
 
@@ -397,7 +192,7 @@ func TestHTTPSubscriptions(t *testing.T) {
 			successThreshold: 3,
 		}
 
-		subs, err := GetSubscriptionsHTTP(&m, log, resiliency.FromConfigurations(log), true)
+		subs, err := GetSubscriptionsHTTP(context.TODO(), &m, log, resiliency.FromConfigurations(log))
 		assert.Equal(t, m.successThreshold, m.callCount)
 		require.NoError(t, err)
 		if assert.Len(t, subs, 1) {
@@ -417,7 +212,7 @@ func TestHTTPSubscriptions(t *testing.T) {
 			alwaysError: true,
 		}
 
-		_, err := GetSubscriptionsHTTP(&m, log, resiliency.FromConfigurations(log), true)
+		_, err := GetSubscriptionsHTTP(context.TODO(), &m, log, resiliency.FromConfigurations(log))
 		require.Error(t, err)
 	})
 }
@@ -441,15 +236,15 @@ func (m *mockUnstableGRPCSubscriptions) ListTopicSubscriptions(ctx context.Conte
 	}
 
 	return &runtimev1pb.ListTopicSubscriptionsResponse{
-		Subscriptions: []*commonv1pb.TopicSubscription{
+		Subscriptions: []*runtimev1pb.TopicSubscription{
 			{
 				PubsubName: "pubsub",
 				Topic:      "topic1",
 				Metadata: map[string]string{
 					"testName": "testValue",
 				},
-				Routes: &commonv1pb.TopicRoutes{
-					Rules: []*commonv1pb.TopicRule{
+				Routes: &runtimev1pb.TopicRoutes{
+					Rules: []*runtimev1pb.TopicRule{
 						{
 							Match: `event.type == "myevent.v3"`,
 							Path:  "myroute.v3",
@@ -472,15 +267,15 @@ type mockGRPCSubscriptions struct {
 
 func (m *mockGRPCSubscriptions) ListTopicSubscriptions(ctx context.Context, in *emptypb.Empty, opts ...grpc.CallOption) (*runtimev1pb.ListTopicSubscriptionsResponse, error) {
 	return &runtimev1pb.ListTopicSubscriptionsResponse{
-		Subscriptions: []*commonv1pb.TopicSubscription{
+		Subscriptions: []*runtimev1pb.TopicSubscription{
 			{
 				PubsubName: "pubsub",
 				Topic:      "topic1",
 				Metadata: map[string]string{
 					"testName": "testValue",
 				},
-				Routes: &commonv1pb.TopicRoutes{
-					Rules: []*commonv1pb.TopicRule{
+				Routes: &runtimev1pb.TopicRoutes{
+					Rules: []*runtimev1pb.TopicRule{
 						{
 							Match: `event.type == "myevent.v3"`,
 							Path:  "myroute.v3",
@@ -500,7 +295,7 @@ func (m *mockGRPCSubscriptions) ListTopicSubscriptions(ctx context.Context, in *
 func TestGRPCSubscriptions(t *testing.T) {
 	t.Run("topics received, no errors", func(t *testing.T) {
 		m := mockGRPCSubscriptions{}
-		subs, err := GetSubscriptionsGRPC(&m, log, resiliency.FromConfigurations(log), false)
+		subs, err := GetSubscriptionsGRPC(context.TODO(), &m, log, resiliency.FromConfigurations(log))
 		require.NoError(t, err)
 		if assert.Len(t, subs, 1) {
 			assert.Equal(t, "topic1", subs[0].Topic)
@@ -519,7 +314,7 @@ func TestGRPCSubscriptions(t *testing.T) {
 			successThreshold: 3,
 		}
 
-		subs, err := GetSubscriptionsGRPC(&m, log, resiliency.FromConfigurations(log), false)
+		subs, err := GetSubscriptionsGRPC(context.TODO(), &m, log, resiliency.FromConfigurations(log))
 		assert.Equal(t, m.successThreshold, m.callCount)
 		require.NoError(t, err)
 		if assert.Len(t, subs, 1) {
@@ -540,9 +335,11 @@ func TestGRPCSubscriptions(t *testing.T) {
 			unimplemented:    true,
 		}
 
-		_, err := GetSubscriptionsGRPC(&m, log, resiliency.FromConfigurations(log), false)
-		require.Error(t, err)
+		subs, err := GetSubscriptionsGRPC(context.TODO(), &m, log, resiliency.FromConfigurations(log))
+		// not implemented error is not retried and is returned as "zero" subscriptions
+		require.NoError(t, err)
 		assert.Equal(t, 1, m.callCount)
+		assert.Empty(t, subs)
 	})
 
 	t.Run("error from app, success after retries with resiliency", func(t *testing.T) {
@@ -550,7 +347,7 @@ func TestGRPCSubscriptions(t *testing.T) {
 			successThreshold: 3,
 		}
 
-		subs, err := GetSubscriptionsGRPC(&m, log, resiliency.FromConfigurations(log), false)
+		subs, err := GetSubscriptionsGRPC(context.TODO(), &m, log, resiliency.FromConfigurations(log))
 		assert.Equal(t, m.successThreshold, m.callCount)
 		require.NoError(t, err)
 		if assert.Len(t, subs, 1) {
@@ -571,38 +368,33 @@ func TestGRPCSubscriptions(t *testing.T) {
 			unimplemented:    true,
 		}
 
-		_, err := GetSubscriptionsGRPC(&m, log, resiliency.FromConfigurations(log), false)
-		require.Error(t, err)
+		subs, err := GetSubscriptionsGRPC(context.TODO(), &m, log, resiliency.FromConfigurations(log))
+		// not implemented error is not retried and is returned as "zero" subscriptions
+		require.NoError(t, err)
 		assert.Equal(t, 1, m.callCount)
+		assert.Empty(t, subs)
 	})
 }
 
-type mockK8sSubscriptions struct {
-	operatorv1pb.OperatorClient
-}
-
-func (m *mockK8sSubscriptions) ListSubscriptionsV2(ctx context.Context, in *operatorv1pb.ListSubscriptionsRequest, opts ...grpc.CallOption) (*operatorv1pb.ListSubscriptionsResponse, error) {
-	v2 := testDeclarativeSubscriptionV2()
-	v2Bytes, err := yaml.Marshal(v2)
-	if err != nil {
-		return nil, err
+func TestGetRuleMatchString(t *testing.T) {
+	cases := []subscriptionsapiV2alpha1.Rule{
+		{
+			Match: `event.type == "myevent.v3"`,
+			Path:  "myroute.v3",
+		},
+		{
+			Match: `event.type == "myevent.v2"`,
+			Path:  "myroute.v2",
+		},
+		{
+			Match: "",
+			Path:  "myroute.v1",
+		},
 	}
-	return &operatorv1pb.ListSubscriptionsResponse{
-		Subscriptions: [][]byte{v2Bytes},
-	}, nil
-}
 
-func TestK8sSubscriptions(t *testing.T) {
-	m := mockK8sSubscriptions{}
-	subs := DeclarativeKubernetes(&m, "testPodName", "testNamespace", log)
-	if assert.Len(t, subs, 1) {
-		assert.Equal(t, "topic1", subs[0].Topic)
-		if assert.Len(t, subs[0].Rules, 3) {
-			assert.Equal(t, "myroute.v3", subs[0].Rules[0].Path)
-			assert.Equal(t, "myroute.v2", subs[0].Rules[1].Path)
-			assert.Equal(t, "myroute", subs[0].Rules[2].Path)
-		}
-		assert.Equal(t, "pubsub", subs[0].PubsubName)
-		assert.Equal(t, "testValue", subs[0].Metadata["testName"])
+	for _, v := range cases {
+		rule, err := CreateRoutingRule(v.Match, v.Path)
+		require.NoError(t, err)
+		assert.Equal(t, v.Match, rule.Match.String())
 	}
 }

@@ -55,24 +55,28 @@ func TestMain(m *testing.M) {
 	// and will be cleaned up after all tests are finished automatically
 	apps = []kube.AppDescription{
 		{
-			AppName:          "actordotnet",
-			DaprEnabled:      true,
-			ImageName:        "e2e-actordotnet",
-			Replicas:         1,
-			IngressEnabled:   true,
-			MetricsEnabled:   true,
-			AppMemoryLimit:   "500Mi",
-			AppMemoryRequest: "200Mi",
+			AppName:             "actordotnet",
+			DaprEnabled:         true,
+			ImageName:           "e2e-actordotnet",
+			DebugLoggingEnabled: true,
+			Config:              "omithealthchecksconfig",
+			Replicas:            1,
+			IngressEnabled:      true,
+			MetricsEnabled:      true,
+			AppMemoryLimit:      "500Mi",
+			AppMemoryRequest:    "200Mi",
 		},
 		{
-			AppName:          "actorpython",
-			DaprEnabled:      true,
-			ImageName:        "e2e-actorpython",
-			Replicas:         1,
-			IngressEnabled:   true,
-			MetricsEnabled:   true,
-			AppMemoryLimit:   "200Mi",
-			AppMemoryRequest: "100Mi",
+			AppName:             "actorpython",
+			DaprEnabled:         true,
+			ImageName:           "e2e-actorpython",
+			DebugLoggingEnabled: true,
+			Config:              "omithealthchecksconfig",
+			Replicas:            1,
+			IngressEnabled:      true,
+			MetricsEnabled:      true,
+			AppMemoryLimit:      "200Mi",
+			AppMemoryRequest:    "100Mi",
 		},
 	}
 
@@ -80,26 +84,30 @@ func TestMain(m *testing.M) {
 		apps = append(apps,
 			// Disables Java test on Windows due to poor support for Java on Windows containers.
 			kube.AppDescription{
-				AppName:          "actorjava",
-				DaprEnabled:      true,
-				ImageName:        "e2e-actorjava",
-				Replicas:         1,
-				IngressEnabled:   true,
-				MetricsEnabled:   true,
-				AppMemoryLimit:   "500Mi",
-				AppMemoryRequest: "200Mi",
+				AppName:             "actorjava",
+				DaprEnabled:         true,
+				ImageName:           "e2e-actorjava",
+				DebugLoggingEnabled: true,
+				Config:              "omithealthchecksconfig",
+				Replicas:            1,
+				IngressEnabled:      true,
+				MetricsEnabled:      true,
+				AppMemoryLimit:      "500Mi",
+				AppMemoryRequest:    "200Mi",
 			},
 			// Disables PHP test for Windows temporarily due to issues with its Windows container.
 			// See https://github.com/dapr/dapr/issues/2953
 			kube.AppDescription{
-				AppName:          "actorphp",
-				DaprEnabled:      true,
-				ImageName:        "e2e-actorphp",
-				Replicas:         1,
-				IngressEnabled:   true,
-				MetricsEnabled:   true,
-				AppMemoryLimit:   "200Mi",
-				AppMemoryRequest: "100Mi",
+				AppName:             "actorphp",
+				DaprEnabled:         true,
+				ImageName:           "e2e-actorphp",
+				DebugLoggingEnabled: true,
+				Config:              "omithealthchecksconfig",
+				Replicas:            1,
+				IngressEnabled:      true,
+				MetricsEnabled:      true,
+				AppMemoryLimit:      "200Mi",
+				AppMemoryRequest:    "100Mi",
 			})
 	}
 
@@ -181,8 +189,8 @@ func TestActorInvocationCrossSDKs(t *testing.T) {
 		healthCheckApp(t, externalURL, numHealthChecks)
 	}
 
-	t.Log("Sleeping for 10 seconds ...")
-	time.Sleep(10 * time.Second)
+	t.Log("Sleeping for 15 seconds ...")
+	time.Sleep(15 * time.Second)
 
 	for _, appSpec := range apps {
 		app := appSpec.AppName
@@ -194,6 +202,7 @@ func TestActorInvocationCrossSDKs(t *testing.T) {
 				method := fmt.Sprintf(tt.method, actorType, uuid.New().String())
 				name := fmt.Sprintf("Test %s calling %s", app, fmt.Sprintf(tt.method, actorType, "ActorId"))
 				t.Run(name, func(t *testing.T) {
+					t.Logf("invoking %s/%s", externalURL, method)
 					resp, err := utils.HTTPPost(fmt.Sprintf("%s/%s", externalURL, method), []byte(tt.payload))
 					t.Log("checking err...")
 					require.NoError(t, err)

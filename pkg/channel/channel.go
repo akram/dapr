@@ -15,6 +15,9 @@ package channel
 
 import (
 	"context"
+	"crypto/tls"
+
+	"google.golang.org/protobuf/types/known/anypb"
 
 	"github.com/dapr/dapr/pkg/apphealth"
 	"github.com/dapr/dapr/pkg/config"
@@ -22,15 +25,20 @@ import (
 )
 
 const (
-	// DefaultChannelAddress is the address that user application listen to.
-	DefaultChannelAddress = "127.0.0.1"
+	// AppChannelMinTLSVersion is the minimum TLS version that the app channel will use.
+	AppChannelMinTLSVersion = tls.VersionTLS12
 )
 
 // AppChannel is an abstraction over communications with user code.
 type AppChannel interface {
-	GetBaseAddress() string
-	GetAppConfig() (*config.ApplicationConfig, error)
-	InvokeMethod(ctx context.Context, req *invokev1.InvokeMethodRequest) (*invokev1.InvokeMethodResponse, error)
+	GetAppConfig(ctx context.Context, appID string) (*config.ApplicationConfig, error)
+	InvokeMethod(ctx context.Context, req *invokev1.InvokeMethodRequest, appID string) (*invokev1.InvokeMethodResponse, error)
 	HealthProbe(ctx context.Context) (bool, error)
 	SetAppHealth(ah *apphealth.AppHealth)
+	TriggerJob(ctx context.Context, name string, data *anypb.Any) (*invokev1.InvokeMethodResponse, error)
+}
+
+// HTTPEndpointAppChannel is an abstraction over communications with http endpoint resources.
+type HTTPEndpointAppChannel interface {
+	InvokeMethod(ctx context.Context, req *invokev1.InvokeMethodRequest, appID string) (*invokev1.InvokeMethodResponse, error)
 }

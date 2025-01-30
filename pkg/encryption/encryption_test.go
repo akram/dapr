@@ -14,15 +14,18 @@ limitations under the License.
 package encryption
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"testing"
 
 	"github.com/dapr/components-contrib/metadata"
 	"github.com/dapr/components-contrib/secretstores"
+	commonapi "github.com/dapr/dapr/pkg/apis/common"
 	"github.com/dapr/dapr/pkg/apis/components/v1alpha1"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -32,7 +35,7 @@ type mockSecretStore struct {
 	secondaryKey string
 }
 
-func (m *mockSecretStore) Init(metadata secretstores.Metadata) error {
+func (m *mockSecretStore) Init(ctx context.Context, metadata secretstores.Metadata) error {
 	if val, ok := metadata.Properties["primaryKey"]; ok {
 		m.primaryKey = val
 	}
@@ -44,7 +47,7 @@ func (m *mockSecretStore) Init(metadata secretstores.Metadata) error {
 	return nil
 }
 
-func (m *mockSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
+func (m *mockSecretStore) GetSecret(ctx context.Context, req secretstores.GetSecretRequest) (secretstores.GetSecretResponse, error) {
 	return secretstores.GetSecretResponse{
 		Data: map[string]string{
 			"primaryKey":   m.primaryKey,
@@ -53,7 +56,7 @@ func (m *mockSecretStore) GetSecret(req secretstores.GetSecretRequest) (secretst
 	}, nil
 }
 
-func (m *mockSecretStore) BulkGetSecret(req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
+func (m *mockSecretStore) BulkGetSecret(ctx context.Context, req secretstores.BulkGetSecretRequest) (secretstores.BulkGetSecretResponse, error) {
 	return secretstores.BulkGetSecretResponse{}, nil
 }
 
@@ -64,16 +67,16 @@ func TestComponentEncryptionKey(t *testing.T) {
 				Name: "statestore",
 			},
 			Spec: v1alpha1.ComponentSpec{
-				Metadata: []v1alpha1.MetadataItem{
+				Metadata: []commonapi.NameValuePair{
 					{
 						Name: primaryEncryptionKey,
-						SecretKeyRef: v1alpha1.SecretKeyRef{
+						SecretKeyRef: commonapi.SecretKeyRef{
 							Name: "primaryKey",
 						},
 					},
 					{
 						Name: secondaryEncryptionKey,
-						SecretKeyRef: v1alpha1.SecretKeyRef{
+						SecretKeyRef: commonapi.SecretKeyRef{
 							Name: "secondaryKey",
 						},
 					},
@@ -91,7 +94,7 @@ func TestComponentEncryptionKey(t *testing.T) {
 		secondaryKey := hex.EncodeToString(bytes[:16]) // 128-bit key
 
 		secretStore := &mockSecretStore{}
-		secretStore.Init(secretstores.Metadata{Base: metadata.Base{
+		secretStore.Init(context.Background(), secretstores.Metadata{Base: metadata.Base{
 			Properties: map[string]string{
 				"primaryKey":   primaryKey,
 				"secondaryKey": secondaryKey,
@@ -99,7 +102,7 @@ func TestComponentEncryptionKey(t *testing.T) {
 		}})
 
 		keys, err := ComponentEncryptionKey(component, secretStore)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 		assert.Equal(t, primaryKey, keys.Primary.Key)
 		assert.Equal(t, secondaryKey, keys.Secondary.Key)
 	})
@@ -110,16 +113,16 @@ func TestComponentEncryptionKey(t *testing.T) {
 				Name: "statestore",
 			},
 			Spec: v1alpha1.ComponentSpec{
-				Metadata: []v1alpha1.MetadataItem{
+				Metadata: []commonapi.NameValuePair{
 					{
 						Name: primaryEncryptionKey,
-						SecretKeyRef: v1alpha1.SecretKeyRef{
+						SecretKeyRef: commonapi.SecretKeyRef{
 							Name: "primaryKey",
 						},
 					},
 					{
 						Name: secondaryEncryptionKey,
-						SecretKeyRef: v1alpha1.SecretKeyRef{
+						SecretKeyRef: commonapi.SecretKeyRef{
 							Name: "secondaryKey",
 						},
 					},
@@ -130,7 +133,7 @@ func TestComponentEncryptionKey(t *testing.T) {
 		keys, err := ComponentEncryptionKey(component, nil)
 		assert.Empty(t, keys.Primary.Key)
 		assert.Empty(t, keys.Secondary.Key)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("no error when component doesn't have encryption keys", func(t *testing.T) {
@@ -139,7 +142,7 @@ func TestComponentEncryptionKey(t *testing.T) {
 				Name: "statestore",
 			},
 			Spec: v1alpha1.ComponentSpec{
-				Metadata: []v1alpha1.MetadataItem{
+				Metadata: []commonapi.NameValuePair{
 					{
 						Name: "something",
 					},
@@ -148,22 +151,22 @@ func TestComponentEncryptionKey(t *testing.T) {
 		}
 
 		_, err := ComponentEncryptionKey(component, nil)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 }
 
 func TestTryGetEncryptionKeyFromMetadataItem(t *testing.T) {
 	t.Run("no secretRef on valid item", func(t *testing.T) {
 		secretStore := &mockSecretStore{}
-		secretStore.Init(secretstores.Metadata{Base: metadata.Base{
+		secretStore.Init(context.Background(), secretstores.Metadata{Base: metadata.Base{
 			Properties: map[string]string{
 				"primaryKey":   "123",
 				"secondaryKey": "456",
 			},
 		}})
 
-		_, err := tryGetEncryptionKeyFromMetadataItem("", v1alpha1.MetadataItem{}, secretStore)
-		assert.Error(t, err)
+		_, err := tryGetEncryptionKeyFromMetadataItem("", commonapi.NameValuePair{}, secretStore)
+		require.Error(t, err)
 	})
 }
 
@@ -174,7 +177,7 @@ func TestCreateCipher(t *testing.T) {
 		}, AESGCMAlgorithm)
 
 		assert.Nil(t, cipherObj)
-		assert.Error(t, err)
+		require.Error(t, err)
 	})
 
 	t.Run("valid 256-bit key", func(t *testing.T) {
@@ -188,7 +191,7 @@ func TestCreateCipher(t *testing.T) {
 		}, AESGCMAlgorithm)
 
 		assert.NotNil(t, cipherObj)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("valid 192-bit key", func(t *testing.T) {
@@ -202,7 +205,7 @@ func TestCreateCipher(t *testing.T) {
 		}, AESGCMAlgorithm)
 
 		assert.NotNil(t, cipherObj)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("valid 128-bit key", func(t *testing.T) {
@@ -216,7 +219,7 @@ func TestCreateCipher(t *testing.T) {
 		}, AESGCMAlgorithm)
 
 		assert.NotNil(t, cipherObj)
-		assert.NoError(t, err)
+		require.NoError(t, err)
 	})
 
 	t.Run("invalid key size", func(t *testing.T) {
@@ -230,7 +233,7 @@ func TestCreateCipher(t *testing.T) {
 		}, AESGCMAlgorithm)
 
 		assert.Nil(t, cipherObj)
-		assert.Error(t, err)
+		require.Error(t, err)
 	})
 
 	t.Run("invalid algorithm", func(t *testing.T) {
@@ -244,6 +247,6 @@ func TestCreateCipher(t *testing.T) {
 		}, "3DES")
 
 		assert.Nil(t, cipherObj)
-		assert.Error(t, err)
+		require.Error(t, err)
 	})
 }

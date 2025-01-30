@@ -16,11 +16,14 @@ package testing
 import (
 	context "context"
 	"encoding/json"
+	"fmt"
+	"reflect"
+	"sync"
 
-	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/anypb"
 	"google.golang.org/protobuf/types/known/emptypb"
 
+	"github.com/dapr/dapr/pkg/api/grpc/metadata"
 	commonv1pb "github.com/dapr/dapr/pkg/proto/common/v1"
 	runtimev1pb "github.com/dapr/dapr/pkg/proto/runtime/v1"
 )
@@ -30,31 +33,45 @@ import (
 //
 //nolint:nosnakecase
 type MockServer struct {
-	Error                    error
-	Subscriptions            []*commonv1pb.TopicSubscription
-	Bindings                 []string
-	BindingEventResponse     runtimev1pb.BindingEventResponse
-	TopicEventResponseStatus runtimev1pb.TopicEventResponse_TopicEventResponseStatus
+	Error                          error
+	Subscriptions                  []*runtimev1pb.TopicSubscription
+	Bindings                       []string
+	BindingEventResponse           runtimev1pb.BindingEventResponse
+	TopicEventResponseStatus       runtimev1pb.TopicEventResponse_TopicEventResponseStatus
+	ListTopicSubscriptionsResponse *runtimev1pb.ListTopicSubscriptionsResponse
+	RequestsReceived               map[string]*runtimev1pb.TopicEventBulkRequest
+	BulkResponsePerPath            map[string]*runtimev1pb.TopicEventBulkResponse
+	initialized                    bool
+	mutex                          sync.Mutex
+	ValidateCloudEventExtension    *map[string]interface{}
+}
+
+func (m *MockServer) Init() {
+	m.initialized = true
+	m.RequestsReceived = make(map[string]*runtimev1pb.TopicEventBulkRequest)
 }
 
 func (m *MockServer) OnInvoke(ctx context.Context, in *commonv1pb.InvokeRequest) (*commonv1pb.InvokeResponse, error) {
 	md, _ := metadata.FromIncomingContext(ctx)
 	dt := map[string]string{
-		"method": in.Method,
+		"method": in.GetMethod(),
 	}
 
 	for k, v := range md {
 		dt[k] = v[0]
 	}
 
-	dt["httpverb"] = in.HttpExtension.GetVerb().String()
-	dt["querystring"] = in.HttpExtension.Querystring
+	dt["httpverb"] = in.GetHttpExtension().GetVerb().String()
+	dt["querystring"] = in.GetHttpExtension().GetQuerystring()
 
 	ds, _ := json.Marshal(dt)
 	return &commonv1pb.InvokeResponse{Data: &anypb.Any{Value: ds}, ContentType: "application/json"}, m.Error
 }
 
 func (m *MockServer) ListTopicSubscriptions(ctx context.Context, in *emptypb.Empty) (*runtimev1pb.ListTopicSubscriptionsResponse, error) {
+	if m.ListTopicSubscriptionsResponse.GetSubscriptions() != nil {
+		return m.ListTopicSubscriptionsResponse, m.Error
+	}
 	return &runtimev1pb.ListTopicSubscriptionsResponse{
 		Subscriptions: m.Subscriptions,
 	}, m.Error
@@ -71,9 +88,44 @@ func (m *MockServer) OnBindingEvent(ctx context.Context, in *runtimev1pb.Binding
 }
 
 func (m *MockServer) OnTopicEvent(ctx context.Context, in *runtimev1pb.TopicEventRequest) (*runtimev1pb.TopicEventResponse, error) {
+	jsonBytes, marshalErr := in.GetExtensions().MarshalJSON()
+	if marshalErr != nil {
+		return nil, marshalErr
+	}
+	extensionsMap := map[string]interface{}{}
+	unmarshalErr := json.Unmarshal(jsonBytes, &extensionsMap)
+	if unmarshalErr != nil {
+		return nil, unmarshalErr
+	}
+
+	if m.ValidateCloudEventExtension != nil {
+		for k, v := range *m.ValidateCloudEventExtension {
+			if val, ok := extensionsMap[k]; !ok || !reflect.DeepEqual(val, v) {
+				return nil, fmt.Errorf("cloud event extension %s with value %s is not valid", k, val)
+			}
+		}
+	}
+
 	return &runtimev1pb.TopicEventResponse{
 		Status: m.TopicEventResponseStatus,
 	}, m.Error
+}
+
+func (m *MockServer) OnBulkTopicEventAlpha1(ctx context.Context, in *runtimev1pb.TopicEventBulkRequest) (*runtimev1pb.TopicEventBulkResponse, error) {
+	m.mutex.Lock()
+	defer m.mutex.Unlock()
+	if !m.initialized {
+		m.Init()
+	}
+	m.RequestsReceived[in.GetPath()] = in
+	if m.BulkResponsePerPath != nil {
+		return m.BulkResponsePerPath[in.GetPath()], m.Error
+	}
+	return nil, m.Error
+}
+
+func (m *MockServer) OnJobEventAlpha1(ctx context.Context, request *runtimev1pb.JobEventRequest) (*runtimev1pb.JobEventResponse, error) {
+	return nil, nil
 }
 
 func (m *MockServer) HealthCheck(ctx context.Context, in *emptypb.Empty) (*runtimev1pb.HealthCheckResponse, error) {

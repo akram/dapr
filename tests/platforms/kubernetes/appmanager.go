@@ -16,16 +16,18 @@ package kubernetes
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"log"
+	"net"
+	"net/url"
 	"os"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
 	apiv1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -44,13 +46,22 @@ const (
 	// PollInterval is how frequently e2e tests will poll for updates.
 	PollInterval = 1 * time.Second
 	// PollTimeout is how long e2e tests will wait for resource updates when polling.
-	PollTimeout = 10 * time.Minute
+	PollTimeout = 8 * time.Minute
 
 	// maxReplicas is the maximum replicas of replica sets.
 	maxReplicas = 10
 
 	// maxSideCarDetectionRetries is the maximum number of retries to detect Dapr sidecar.
 	maxSideCarDetectionRetries = 3
+
+	// KindDefaultContextPrefix is the prefix of the default kind cluster
+	KindDefaultContextPrefix = "kind-"
+
+	// kindDefaultContextName is the name of the default kind cluster
+	kindDefaultContextName = "kind"
+
+	// kindClusterNameEnvVar is the environment variable name which will have the name of the kind cluster.
+	kindClusterNameEnvVar = "DAPR_TEST_KIND_CLUSTER_NAME"
 )
 
 // AppManager holds Kubernetes clients and namespace used for test apps
@@ -73,9 +84,9 @@ type PodInfo struct {
 }
 
 // NewAppManager creates AppManager instance.
-func NewAppManager(kubeClients *KubeClient, namespace string, app AppDescription) *AppManager {
+func NewAppManager(client *KubeClient, namespace string, app AppDescription) *AppManager {
 	return &AppManager{
-		client:    kubeClients,
+		client:    client,
 		namespace: namespace,
 		app:       app,
 		ctx:       context.Background(),
@@ -96,21 +107,12 @@ func (m *AppManager) App() AppDescription {
 func (m *AppManager) Init(runCtx context.Context) error {
 	m.ctx = runCtx
 
-	// Get or create test namespaces
-	if _, err := m.GetOrCreateNamespace(); err != nil {
-		return err
-	}
-
 	// TODO: Dispose app if option is required
 	if err := m.Dispose(true); err != nil {
 		return err
 	}
 
-	m.logPrefix = os.Getenv(ContainerLogPathEnvVar)
-
-	if m.logPrefix == "" {
-		m.logPrefix = ContainerLogDefaultPath
-	}
+	m.logPrefix = logPrefix
 
 	if err := os.MkdirAll(m.logPrefix, os.ModePerm); err != nil {
 		log.Printf("Failed to create output log directory '%s' Error was: '%s'. Container logs will be discarded", m.logPrefix, err)
@@ -149,22 +151,24 @@ func (m *AppManager) Init(runCtx context.Context) error {
 
 	if !m.app.IsJob {
 		// Job cannot have side car validated because it is shutdown on successful completion.
-		log.Printf("Validating sidecar for app %v ....", m.app.AppName)
-		for i := 0; i <= maxSideCarDetectionRetries; i++ {
-			// Validate daprd side car is injected
-			if err := m.ValidateSidecar(); err != nil {
-				if i == maxSideCarDetectionRetries {
-					return err
+		if m.app.DaprEnabled {
+			log.Printf("Validating sidecar for app %v ....", m.app.AppName)
+			for i := 0; i <= maxSideCarDetectionRetries; i++ {
+				// Validate daprd side car is injected
+				if err := m.ValidateSidecar(); err != nil {
+					if i == maxSideCarDetectionRetries {
+						return err
+					}
+
+					log.Printf("Did not find sidecar for app %v error %s, retrying ....", m.app.AppName, err)
+					time.Sleep(10 * time.Second)
+					continue
 				}
 
-				log.Printf("Did not find sidecar for app %v error %s, retrying ....", m.app.AppName, err)
-				time.Sleep(10 * time.Second)
-				continue
+				break
 			}
-
-			break
+			log.Printf("Sidecar for app %v has been validated.", m.app.AppName)
 		}
-		log.Printf("Sidecar for app %v has been validated.", m.app.AppName)
 
 		// Create Ingress endpoint
 		log.Printf("Creating ingress for app %v ....", m.app.AppName)
@@ -208,7 +212,7 @@ func (m *AppManager) Dispose(wait bool) error {
 			}
 		}
 
-		if _, err := m.WaitUntilServiceState(m.IsServiceDeleted); err != nil {
+		if _, err := m.WaitUntilServiceState(m.app.AppName, m.IsServiceDeleted); err != nil {
 			return err
 		}
 	} else {
@@ -228,7 +232,7 @@ func (m *AppManager) ScheduleJob() (*batchv1.Job, error) {
 	jobsClient := m.client.Jobs(m.namespace)
 	obj := buildJobObject(m.namespace, m.app)
 
-	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, time.Minute)
 	result, err := jobsClient.Create(ctx, obj, metav1.CreateOptions{})
 	cancel()
 	if err != nil {
@@ -244,11 +248,12 @@ func (m *AppManager) WaitUntilJobState(isState func(*batchv1.Job, error) bool) (
 
 	var lastJob *batchv1.Job
 
-	waitErr := wait.PollImmediate(PollInterval, PollTimeout, func() (bool, error) {
+	ctx, cancel := context.WithTimeout(m.ctx, PollTimeout)
+	defer cancel()
+
+	waitErr := wait.PollUntilContextCancel(ctx, PollInterval, true, func(ctx context.Context) (bool, error) {
 		var err error
-		ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
 		lastJob, err = jobsClient.Get(ctx, m.app.AppName, metav1.GetOptions{})
-		cancel()
 		done := isState(lastJob, err)
 		if !done && err != nil {
 			return true, err
@@ -257,7 +262,11 @@ func (m *AppManager) WaitUntilJobState(isState func(*batchv1.Job, error) bool) (
 	})
 
 	if waitErr != nil {
-		return nil, fmt.Errorf("job %q is not in desired state, received: %+v: %s", m.app.AppName, lastJob, waitErr)
+		// Try to get the logs from the containers that aren't starting, if we can get anything
+		// We ignore errors here
+		_ = m.StreamContainerLogs()
+
+		return nil, fmt.Errorf("job %q is not in desired state, received: %#v: %s", m.app.AppName, lastJob, waitErr)
 	}
 
 	return lastJob, nil
@@ -268,7 +277,7 @@ func (m *AppManager) Deploy() (*appsv1.Deployment, error) {
 	deploymentsClient := m.client.Deployments(m.namespace)
 	obj := buildDeploymentObject(m.namespace, m.app)
 
-	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, time.Minute)
 	result, err := deploymentsClient.Create(ctx, obj, metav1.CreateOptions{})
 	cancel()
 	if err != nil {
@@ -284,10 +293,11 @@ func (m *AppManager) WaitUntilDeploymentState(isState func(*appsv1.Deployment, e
 
 	var lastDeployment *appsv1.Deployment
 
-	waitErr := wait.PollImmediate(PollInterval, PollTimeout, func() (bool, error) {
+	ctx, cancel := context.WithTimeout(m.ctx, PollTimeout)
+	defer cancel()
+
+	waitErr := wait.PollUntilContextCancel(ctx, PollInterval, true, func(ctx context.Context) (bool, error) {
 		var err error
-		ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
-		defer cancel()
 		lastDeployment, err = deploymentsClient.Get(ctx, m.app.AppName, metav1.GetOptions{})
 		done := isState(lastDeployment, err)
 		if !done && err != nil {
@@ -300,7 +310,7 @@ func (m *AppManager) WaitUntilDeploymentState(isState func(*appsv1.Deployment, e
 		// get deployment's Pods detail status info
 		podClient := m.client.Pods(m.namespace)
 		// Filter only 'testapp=appName' labeled Pods
-		ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+		ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 		defer cancel()
 		podList, err := podClient.List(ctx, metav1.ListOptions{
 			LabelSelector: fmt.Sprintf("%s=%s", TestAppLabelKey, m.app.AppName),
@@ -311,12 +321,21 @@ func (m *AppManager) WaitUntilDeploymentState(isState func(*appsv1.Deployment, e
 		podStatus := map[string][]apiv1.ContainerStatus{}
 		if err == nil {
 			for i, pod := range podList.Items {
+				name := pod.Name
+				podStatus[name] = pod.Status.ContainerStatuses
+				request := podClient.GetLogs(name, &apiv1.PodLogOptions{
+					Container: DaprSideCarName,
+					Previous:  true,
+				})
+				var body []byte
+				if body, err = request.DoRaw(context.Background()); err != nil {
+					log.Printf("(%s) get previous pod log failed. err: %s\n", name, err.Error())
+				}
+				log.Printf("previous pod: %s, logs: %s\n", name, string(body))
 				// Reset Spec and ObjectMeta which could contain sensitive info like credentials
 				pod.Spec.Reset()
 				pod.ObjectMeta.Reset()
 				podList.Items[i] = pod
-
-				podStatus[pod.Name] = pod.Status.ContainerStatuses
 			}
 			j, _ := json.Marshal(podList)
 			log.Printf("deployment %s relate pods: %s", m.app.AppName, string(j))
@@ -324,7 +343,11 @@ func (m *AppManager) WaitUntilDeploymentState(isState func(*appsv1.Deployment, e
 			log.Printf("Error list pod for deployment %s. Error was %s", m.app.AppName, err)
 		}
 
-		return nil, fmt.Errorf("deployment %q is not in desired state, received: %+v pod status: %+v error: %s", m.app.AppName, lastDeployment, podStatus, waitErr)
+		// Try to get the logs from the containers that aren't starting, if we can get anything
+		// We ignore errors here
+		_ = m.StreamContainerLogs()
+
+		return nil, fmt.Errorf("deployment %q is not in desired state, received: %#v pod status: %#v error: %s", m.app.AppName, lastDeployment, podStatus, waitErr)
 	}
 
 	return lastDeployment, nil
@@ -332,7 +355,10 @@ func (m *AppManager) WaitUntilDeploymentState(isState func(*appsv1.Deployment, e
 
 // WaitUntilSidecarPresent waits until Dapr sidecar is present.
 func (m *AppManager) WaitUntilSidecarPresent() error {
-	waitErr := wait.PollImmediate(PollInterval, PollTimeout, func() (bool, error) {
+	ctx, cancel := context.WithTimeout(m.ctx, PollTimeout)
+	defer cancel()
+
+	waitErr := wait.PollUntilContextCancel(ctx, PollInterval, true, func(ctx context.Context) (bool, error) {
 		allDaprd, minContainerCount, maxContainerCount, err := m.getContainerInfo()
 		log.Printf(
 			"Checking if Dapr sidecar is present on app %s (minContainerCount=%d, maxContainerCount=%d, allDaprd=%v): %v ...",
@@ -366,23 +392,23 @@ func (m *AppManager) IsDeploymentDone(deployment *appsv1.Deployment, err error) 
 
 // IsJobDeleted returns true if job does not exist.
 func (m *AppManager) IsJobDeleted(job *batchv1.Job, err error) bool {
-	return err != nil && errors.IsNotFound(err)
+	return err != nil && apierrors.IsNotFound(err)
 }
 
 // IsDeploymentDeleted returns true if deployment does not exist or current pod replica is zero.
 func (m *AppManager) IsDeploymentDeleted(deployment *appsv1.Deployment, err error) bool {
-	return err != nil && errors.IsNotFound(err)
+	return err != nil && apierrors.IsNotFound(err)
 }
 
 // ValidateSidecar validates that dapr side car is running in dapr enabled pods.
 func (m *AppManager) ValidateSidecar() error {
 	if !m.app.DaprEnabled {
-		return fmt.Errorf("dapr is not enabled for this app")
+		return errors.New("dapr is not enabled for this app")
 	}
 
 	podClient := m.client.Pods(m.namespace)
 	// Filter only 'testapp=appName' labeled Pods
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	podList, err := podClient.List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s", TestAppLabelKey, m.app.AppName),
 	})
@@ -417,13 +443,13 @@ func (m *AppManager) ValidateSidecar() error {
 // getSidecarInfo returns if sidecar is present and how many containers there are.
 func (m *AppManager) getContainerInfo() (bool, int, int, error) {
 	if !m.app.DaprEnabled {
-		return false, 0, 0, fmt.Errorf("dapr is not enabled for this app")
+		return false, 0, 0, errors.New("dapr is not enabled for this app")
 	}
 
 	podClient := m.client.Pods(m.namespace)
 
 	// Filter only 'testapp=appName' labeled Pods
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	podList, err := podClient.List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s", TestAppLabelKey, m.app.AppName),
 	})
@@ -468,7 +494,7 @@ func (m *AppManager) getContainerInfo() (bool, int, int, error) {
 func (m *AppManager) DoPortForwarding(podName string, targetPorts ...int) ([]int, error) {
 	podClient := m.client.Pods(m.namespace)
 	// Filter only 'testapp=appName' labeled Pods
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	podList, err := podClient.List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s", TestAppLabelKey, m.app.AppName),
 	})
@@ -498,7 +524,7 @@ func (m *AppManager) ScaleDeploymentReplica(replicas int32) error {
 
 	deploymentsClient := m.client.Deployments(m.namespace)
 
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	scale, err := deploymentsClient.GetScale(ctx, m.app.AppName, metav1.GetOptions{})
 	cancel()
 	if err != nil {
@@ -512,7 +538,7 @@ func (m *AppManager) ScaleDeploymentReplica(replicas int32) error {
 	scale.Spec.Replicas = replicas
 	m.app.Replicas = replicas
 
-	ctx, cancel = context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel = context.WithTimeout(m.ctx, 30*time.Second)
 	_, err = deploymentsClient.UpdateScale(ctx, m.app.AppName, scale, metav1.UpdateOptions{})
 	cancel()
 
@@ -523,7 +549,7 @@ func (m *AppManager) ScaleDeploymentReplica(replicas int32) error {
 func (m *AppManager) SetAppEnv(key, value string) error {
 	deploymentsClient := m.client.Deployments(m.namespace)
 
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	deployment, err := deploymentsClient.Get(ctx, m.app.AppName, metav1.GetOptions{})
 	cancel()
 	if err != nil {
@@ -554,7 +580,7 @@ func (m *AppManager) SetAppEnv(key, value string) error {
 		}
 	}
 
-	ctx, cancel = context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel = context.WithTimeout(m.ctx, 30*time.Second)
 	_, err = deploymentsClient.Update(ctx, deployment, metav1.UpdateOptions{})
 	cancel()
 
@@ -565,7 +591,7 @@ func (m *AppManager) SetAppEnv(key, value string) error {
 func (m *AppManager) CreateIngressService() (*apiv1.Service, error) {
 	serviceClient := m.client.Services(m.namespace)
 	obj := buildServiceObject(m.namespace, m.app)
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	result, err := serviceClient.Create(ctx, obj, metav1.CreateOptions{})
 	cancel()
 	if err != nil {
@@ -578,8 +604,9 @@ func (m *AppManager) CreateIngressService() (*apiv1.Service, error) {
 // AcquireExternalURL gets external ingress endpoint from service when it is ready.
 func (m *AppManager) AcquireExternalURL() string {
 	log.Printf("Waiting until service ingress is ready for %s...\n", m.app.AppName)
-	svc, err := m.WaitUntilServiceState(m.IsServiceIngressReady)
+	svc, err := m.WaitUntilServiceState(m.app.AppName, m.IsServiceIngressReady)
 	if err != nil {
+		log.Printf("Service ingress for %s is not ready: %s", m.app.AppName, err)
 		return ""
 	}
 
@@ -589,18 +616,19 @@ func (m *AppManager) AcquireExternalURL() string {
 }
 
 // WaitUntilServiceState waits until isState returns true.
-func (m *AppManager) WaitUntilServiceState(isState func(*apiv1.Service, error) bool) (*apiv1.Service, error) {
+func (m *AppManager) WaitUntilServiceState(svcName string, isState func(*apiv1.Service, error) bool) (*apiv1.Service, error) {
 	serviceClient := m.client.Services(m.namespace)
 	var lastService *apiv1.Service
 
-	waitErr := wait.PollImmediate(PollInterval, PollTimeout, func() (bool, error) {
+	ctx, cancel := context.WithTimeout(m.ctx, PollTimeout)
+	defer cancel()
+
+	waitErr := wait.PollUntilContextCancel(ctx, PollInterval, true, func(ctx context.Context) (bool, error) {
 		var err error
-		ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
-		lastService, err = serviceClient.Get(ctx, m.app.AppName, metav1.GetOptions{})
-		cancel()
+		lastService, err = serviceClient.Get(ctx, svcName, metav1.GetOptions{})
 		done := isState(lastService, err)
 		if !done && err != nil {
-			log.Printf("wait for %s: %s", m.app.AppName, err)
+			log.Printf("wait for %s: %s", svcName, err)
 			return true, err
 		}
 
@@ -608,7 +636,7 @@ func (m *AppManager) WaitUntilServiceState(isState func(*apiv1.Service, error) b
 	})
 
 	if waitErr != nil {
-		return lastService, fmt.Errorf("service %q is not in desired state, received: %+v: %s", m.app.AppName, lastService, waitErr)
+		return lastService, fmt.Errorf("service %q is not in desired state, received: %#v: %s", m.app.AppName, lastService, waitErr)
 	}
 
 	return lastService, nil
@@ -634,6 +662,19 @@ func (m *AppManager) AcquireExternalURLFromService(svc *apiv1.Service) string {
 	} else if minikubeExternalIP := m.minikubeNodeIP(); minikubeExternalIP != "" {
 		// if test cluster is minikube, external ip address is minikube node address
 		address, port = minikubeExternalIP, svcFstPort.NodePort
+	} else if m.isKindCluster() && m.isCurrentContextLocal() {
+		// Support Kind cluster with specific name that is used in the `make setup-kind` target
+		host := m.getCurrentContextHost()
+		log.Printf("Running in Kind cluster, forwarding ports to %s", host)
+
+		// if test cluster is kind, "external" ip address is localhost or 127.0.0.1, and we need to forward port
+		ports, err := m.DoPortForwarding("", int(svcFstPort.Port))
+		if err != nil {
+			log.Printf("error forwarding ports: %s", err)
+			return ""
+		}
+
+		address, port = host, int32(ports[0]) //nolint:gosec
 	}
 	return fmt.Sprintf("%s:%d", address, port)
 }
@@ -650,7 +691,7 @@ func (m *AppManager) IsServiceIngressReady(svc *apiv1.Service, err error) bool {
 
 	if len(svc.Spec.Ports) > 0 {
 		// TODO: Support the other local k8s clusters
-		return m.minikubeNodeIP() != "" || !m.app.ShouldBeExposed()
+		return m.minikubeNodeIP() != "" || !m.app.ShouldBeExposed() || (m.isKindCluster() && m.isCurrentContextLocal())
 	}
 
 	return false
@@ -658,7 +699,7 @@ func (m *AppManager) IsServiceIngressReady(svc *apiv1.Service, err error) bool {
 
 // IsServiceDeleted returns true if service does not exist.
 func (m *AppManager) IsServiceDeleted(svc *apiv1.Service, err error) bool {
-	return err != nil && errors.IsNotFound(err)
+	return err != nil && apierrors.IsNotFound(err)
 }
 
 func (m *AppManager) minikubeNodeIP() string {
@@ -669,16 +710,53 @@ func (m *AppManager) minikubeNodeIP() string {
 	return os.Getenv(MiniKubeIPEnvVar)
 }
 
+func (m *AppManager) isKindCluster() bool {
+	customClusterName := os.Getenv(kindClusterNameEnvVar)
+	if customClusterName != "" {
+		return m.client.RawConfig.CurrentContext == KindDefaultContextPrefix+customClusterName
+	}
+	return m.client.RawConfig.CurrentContext == KindDefaultContextPrefix+kindDefaultContextName
+}
+
+func (m *AppManager) isCurrentContextLocal() bool {
+	host := m.getCurrentContextHost()
+	if host == "" {
+		return false
+	}
+
+	ip := net.ParseIP(host)
+	return ip.IsLoopback()
+}
+
+func (m *AppManager) getCurrentContextHost() string {
+	currentContextName := m.client.RawConfig.CurrentContext
+	currentContext := m.client.RawConfig.Contexts[currentContextName]
+	currentCluster := m.client.RawConfig.Clusters[currentContext.Cluster]
+
+	serverAddressHost, err := url.Parse(currentCluster.Server)
+	if err != nil {
+		log.Printf("error parsing server url: %s, error: %+v", currentCluster.Server, err)
+		return ""
+	}
+
+	host, _, err := net.SplitHostPort(serverAddressHost.Host)
+	if err != nil {
+		log.Printf("error splitting host and port: %s, error: %+v", serverAddressHost.Host, err)
+		return ""
+	}
+	return host
+}
+
 // DeleteJob deletes job for the test app.
 func (m *AppManager) DeleteJob(ignoreNotFound bool) error {
 	jobsClient := m.client.Jobs(m.namespace)
 	deletePolicy := metav1.DeletePropagationForeground
 
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	defer cancel()
 	if err := jobsClient.Delete(ctx, m.app.AppName, metav1.DeleteOptions{
 		PropagationPolicy: &deletePolicy,
-	}); err != nil && (ignoreNotFound && !errors.IsNotFound(err)) {
+	}); err != nil && (ignoreNotFound && !apierrors.IsNotFound(err)) {
 		return err
 	}
 
@@ -690,11 +768,11 @@ func (m *AppManager) DeleteDeployment(ignoreNotFound bool) error {
 	deploymentsClient := m.client.Deployments(m.namespace)
 	deletePolicy := metav1.DeletePropagationForeground
 
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	defer cancel()
 	if err := deploymentsClient.Delete(ctx, m.app.AppName, metav1.DeleteOptions{
 		PropagationPolicy: &deletePolicy,
-	}); err != nil && (ignoreNotFound && !errors.IsNotFound(err)) {
+	}); err != nil && (ignoreNotFound && !apierrors.IsNotFound(err)) {
 		return err
 	}
 
@@ -706,45 +784,27 @@ func (m *AppManager) DeleteService(ignoreNotFound bool) error {
 	serviceClient := m.client.Services(m.namespace)
 	deletePolicy := metav1.DeletePropagationForeground
 
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	defer cancel()
 	if err := serviceClient.Delete(ctx, m.app.AppName, metav1.DeleteOptions{
 		PropagationPolicy: &deletePolicy,
-	}); err != nil && (ignoreNotFound && !errors.IsNotFound(err)) {
+	}); err != nil && (ignoreNotFound && !apierrors.IsNotFound(err)) {
 		return err
 	}
 
 	return nil
 }
 
-// GetOrCreateNamespace gets or creates namespace unless namespace exists.
-func (m *AppManager) GetOrCreateNamespace() (*apiv1.Namespace, error) {
-	namespaceClient := m.client.Namespaces()
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
-	ns, err := namespaceClient.Get(ctx, m.namespace, metav1.GetOptions{})
-	cancel()
-
-	if err != nil && errors.IsNotFound(err) {
-		obj := buildNamespaceObject(m.namespace)
-		ctx, cancel = context.WithTimeout(m.ctx, 15*time.Second)
-		ns, err = namespaceClient.Create(ctx, obj, metav1.CreateOptions{})
-		cancel()
-		return ns, err
-	}
-
-	return ns, err
-}
-
 // GetHostDetails returns the name and IP address of the pods running the app.
 func (m *AppManager) GetHostDetails() ([]PodInfo, error) {
 	if !m.app.DaprEnabled {
-		return nil, fmt.Errorf("dapr is not enabled for this app")
+		return nil, errors.New("dapr is not enabled for this app")
 	}
 
 	podClient := m.client.Pods(m.namespace)
 
 	// Filter only 'testapp=appName' labeled Pods
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	podList, err := podClient.List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s", TestAppLabelKey, m.app.AppName),
 	})
@@ -770,65 +830,7 @@ func (m *AppManager) GetHostDetails() ([]PodInfo, error) {
 
 // StreamContainerLogs get container logs for all containers in the pod and saves them to disk.
 func (m *AppManager) StreamContainerLogs() error {
-	podClient := m.client.Pods(m.namespace)
-
-	// Filter only 'testapp=appName' labeled Pods
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
-	podList, err := podClient.List(ctx, metav1.ListOptions{
-		LabelSelector: fmt.Sprintf("%s=%s", TestAppLabelKey, m.app.AppName),
-	})
-	cancel()
-	if err != nil {
-		return err
-	}
-
-	for _, pod := range podList.Items {
-		for _, container := range pod.Spec.Containers {
-			go func(pod, container string) {
-				filename := fmt.Sprintf("%s/%s.%s.log", m.logPrefix, pod, container)
-				log.Printf("Streaming Kubernetes logs to %s", filename)
-				req := podClient.GetLogs(pod, &apiv1.PodLogOptions{
-					Container: container,
-					Follow:    true,
-				})
-				stream, err := req.Stream(m.ctx)
-				if err != nil {
-					if err != context.Canceled {
-						log.Printf("Error reading log stream for %s. Error was %s", filename, err)
-					} else {
-						log.Printf("Saved container logs to %s", filename)
-					}
-					return
-				}
-				defer stream.Close()
-
-				fh, err := os.Create(filename)
-				if err != nil {
-					if err != context.Canceled {
-						log.Printf("Error creating %s. Error was %s", filename, err)
-					} else {
-						log.Printf("Saved container logs to %s", filename)
-					}
-					return
-				}
-				defer fh.Close()
-
-				_, err = io.Copy(fh, stream)
-				if err != nil {
-					if err != context.Canceled {
-						log.Printf("Error reading log stream for %s. Error was %s", filename, err)
-					} else {
-						log.Printf("Saved container logs to %s", filename)
-					}
-					return
-				}
-
-				log.Printf("Saved container logs to %s", filename)
-			}(pod.GetName(), container.Name)
-		}
-	}
-
-	return nil
+	return StreamContainerLogsToDisk(m.ctx, m.app.AppName, m.client.Pods(m.namespace))
 }
 
 // GetCPUAndMemory returns the Cpu and Memory usage for the dapr app or sidecar.
@@ -842,7 +844,7 @@ func (m *AppManager) GetCPUAndMemory(sidecar bool) (int64, float64, error) {
 	var maxMemory float64 = -1
 	for _, pod := range pods {
 		podName := pod.Name
-		ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+		ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 		metrics, err := m.client.MetricsClient.MetricsV1beta1().PodMetricses(m.namespace).Get(ctx, podName, metav1.GetOptions{})
 		cancel()
 		if err != nil {
@@ -877,13 +879,13 @@ func (m *AppManager) GetCPUAndMemory(sidecar bool) (int64, float64, error) {
 // GetTotalRestarts returns the total number of restarts for the app or sidecar.
 func (m *AppManager) GetTotalRestarts() (int, error) {
 	if !m.app.DaprEnabled {
-		return 0, fmt.Errorf("dapr is not enabled for this app")
+		return 0, errors.New("dapr is not enabled for this app")
 	}
 
 	podClient := m.client.Pods(m.namespace)
 
 	// Filter only 'testapp=appName' labeled Pods
-	ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+	ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 	podList, err := podClient.List(ctx, metav1.ListOptions{
 		LabelSelector: fmt.Sprintf("%s=%s", TestAppLabelKey, m.app.AppName),
 	})
@@ -894,7 +896,7 @@ func (m *AppManager) GetTotalRestarts() (int, error) {
 
 	restartCount := 0
 	for _, pod := range podList.Items {
-		ctx, cancel := context.WithTimeout(m.ctx, 15*time.Second)
+		ctx, cancel := context.WithTimeout(m.ctx, 30*time.Second)
 		pod, err := podClient.Get(ctx, pod.GetName(), metav1.GetOptions{})
 		cancel()
 		if err != nil {

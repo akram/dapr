@@ -1,17 +1,33 @@
 logLevel: info
+component: placement
 
-# Specify full docker image name including registry url to use a custom placement service image
-# Otherwise, helm chart will use {{ .Values.global.registry }}/dapr:{{ .Values.global.tag }}
+# Override this to use a custom placement service image.
+# If the image name contains a "/", it is assumed to be a full docker image name, including the registry url and tag.
+# Otherwise, the helm chart will use {{ .Values.global.registry }}/{{ .Values.image.name }}:{{ .Values.global.tag }}
 image:
-  name: ""
+  name: "placement"
 
 nameOverride: ""
 fullnameOverride: ""
+
+statefulsetAnnotations: {}
+
+service:
+  annotations: {}
 
 ports:
   protocol: TCP
   apiPort: 50005
   raftRPCPort: 8201
+
+scaleZero: false
+ha: false
+
+maxActorApiLevel: 10
+minActorApiLevel: 0
+keepAliveTime: 2s
+keepAliveTimeout: 3s
+disseminateTimeout: 2s
 
 cluster:
   forceInMemoryLog: false
@@ -23,6 +39,8 @@ volumeclaims:
   storageClassName:
 
 replicationFactor: 100
+
+metadataEnabled: false
 
 livenessProbe:
   initialDelaySeconds: 10
@@ -40,3 +58,6 @@ debug:
 
 runAsNonRoot: true
 resources: {}
+
+extraEnvVars: {}
+

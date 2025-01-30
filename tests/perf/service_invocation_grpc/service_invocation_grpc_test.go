@@ -29,6 +29,7 @@ import (
 	"github.com/dapr/dapr/tests/perf/utils"
 	kube "github.com/dapr/dapr/tests/platforms/kubernetes"
 	"github.com/dapr/dapr/tests/runner"
+	"github.com/dapr/dapr/tests/runner/summary"
 )
 
 const numHealthChecks = 60 // Number of times to check for endpoint health per app.
@@ -92,7 +93,12 @@ func TestMain(m *testing.M) {
 }
 
 func TestServiceInvocationGrpcPerformance(t *testing.T) {
-	p := perf.Params()
+	p := perf.Params(
+		perf.WithQPS(1000),
+		perf.WithConnections(16),
+		perf.WithDuration("1m"),
+		perf.WithPayloadSize(1024),
+	)
 	t.Logf("running service invocation grpc test with params: qps=%v, connections=%v, duration=%s, payload size=%v, payload=%v", p.QPS, p.ClientConnections, p.TestDuration, p.PayloadSizeKB, p.Payload)
 
 	// Get the ingress external url of test app
@@ -116,7 +122,7 @@ func TestServiceInvocationGrpcPerformance(t *testing.T) {
 	// Perform baseline test
 	p.Grpc = true
 	p.Dapr = "capability=invoke,target=appcallback,method=load"
-	p.TargetEndpoint = fmt.Sprintf("http://testapp:3000")
+	p.TargetEndpoint = "http://testapp:3000"
 	body, err := json.Marshal(&p)
 	require.NoError(t, err)
 
@@ -129,10 +135,32 @@ func TestServiceInvocationGrpcPerformance(t *testing.T) {
 	// fast fail if daprResp starts with error
 	require.False(t, strings.HasPrefix(string(baselineResp), "error"))
 
+	// Perform an initial run with Dapr as warmup
+	warmup := perf.Params(
+		perf.WithQPS(100),
+		perf.WithConnections(16),
+		perf.WithDuration("10s"),
+		perf.WithPayloadSize(1024),
+	)
+	warmup.Grpc = true
+	warmup.Dapr = "capability=invoke,target=dapr,method=load,appid=testapp"
+	warmup.TargetEndpoint = "http://localhost:50001"
+	body, err = json.Marshal(warmup)
+	require.NoError(t, err)
+
+	t.Log("running warmup...")
+	warmupResp, err := utils.HTTPPost(fmt.Sprintf("%s/test", testerAppURL), body)
+	t.Logf("warmup results: %s", string(warmupResp))
+	require.NoError(t, err)
+	require.NotEmpty(t, warmupResp)
+	// fast fail if warmupResp starts with error
+	require.False(t, strings.HasPrefix(string(warmupResp), "error"))
+
 	// Perform dapr test
+	p.Grpc = true
 	p.Dapr = "capability=invoke,target=dapr,method=load,appid=testapp"
-	p.TargetEndpoint = fmt.Sprintf("http://localhost:50001")
-	body, err = json.Marshal(&p)
+	p.TargetEndpoint = "http://localhost:50001"
+	body, err = json.Marshal(p)
 	require.NoError(t, err)
 
 	t.Log("running dapr test...")
@@ -175,21 +203,26 @@ func TestServiceInvocationGrpcPerformance(t *testing.T) {
 		t.Logf("added latency for %s percentile: %sms", v, fmt.Sprintf("%.2f", latency))
 	}
 	avg := (daprResult.DurationHistogram.Avg - baselineResult.DurationHistogram.Avg) * 1000
-	t.Logf("baseline latency avg: %sms", fmt.Sprintf("%.2f", baselineResult.DurationHistogram.Avg*1000))
-	t.Logf("dapr latency avg: %sms", fmt.Sprintf("%.2f", daprResult.DurationHistogram.Avg*1000))
+	baselineLatency := baselineResult.DurationHistogram.Avg * 1000
+	daprLatency := daprResult.DurationHistogram.Avg * 1000
+	t.Logf("baseline latency avg: %sms", fmt.Sprintf("%.2f", baselineLatency))
+	t.Logf("dapr latency avg: %sms", fmt.Sprintf("%.2f", daprLatency))
 	t.Logf("added latency avg: %sms", fmt.Sprintf("%.2f", avg))
 
-	report := perf.NewTestReport(
-		[]perf.TestResult{baselineResult, daprResult},
-		"Service Invocation",
-		sidecarUsage,
-		appUsage)
-	report.SetTotalRestartCount(restarts)
-	err = utils.UploadAzureBlob(report)
-
-	if err != nil {
-		t.Error(err)
-	}
+	summary.ForTest(t).
+		Service("testapp").
+		CPU(appUsage.CPUm).
+		Memory(appUsage.MemoryMb).
+		SidecarCPU(sidecarUsage.CPUm).
+		SidecarMemory(sidecarUsage.MemoryMb).
+		Restarts(restarts).
+		BaselineLatency(baselineLatency).
+		DaprLatency(daprLatency).
+		AddedLatency(avg).
+		ActualQPS(daprResult.ActualQPS).
+		Params(p).
+		OutputFortio(daprResult).
+		Flush()
 
 	require.Equal(t, 0, daprResult.RetCodes.Num400)
 	require.Equal(t, 0, daprResult.RetCodes.Num500)
